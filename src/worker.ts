@@ -51,8 +51,8 @@ export default {
       if (path === "/api/inspect" && method === "GET") {
         const target = url.searchParams.get("url") || "";
         if (!/^https?:\/\//.test(target)) return json({ error: "Give a full link" }, 400);
-        const info = await readProduct(target, env, url.searchParams.get("render") === "1");
-        return json({ ...info, image: info.image ? "(found)" : null }, 200, { "cache-control": "no-store" });
+        const info = await readProduct(target, env, url.searchParams.get("render") === "1" ? "render" : "auto");
+        return json({ ...info, canonical: (await canonicalUrl(new URL(target))).href, image: info.image ? "(found)" : null }, 200, { "cache-control": "no-store" });
       }
 
       if (path === "/api/products" && method === "GET") return await listProducts(env, owner);
@@ -138,7 +138,7 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
   } catch {
     return json({ error: "Paste a full product link starting with https://" }, 400);
   }
-  url.hash = "";
+  url = await canonicalUrl(url);
 
   const existing = await env.DB.prepare("SELECT id FROM products WHERE owner = ? AND url = ?")
     .bind(owner, url.href).first();
@@ -149,9 +149,25 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
     return json({ error: `You can track up to ${MAX_PER_OWNER} products. Remove one first.` }, 429);
   }
 
-  const info = await readProduct(url.href, env, false);
+  let info = await readProduct(url.href, env, "auto");
   if (info.price == null) {
     return json({ error: info.error || "Couldn't find a price on that page" }, 422);
+  }
+
+  // A share link that redirected: keep the real product page, and see if it
+  // can be read without a browser (cheaper for every later check).
+  if (info.finalUrl && info.finalUrl !== url.href) {
+    const resolved = await canonicalUrl(new URL(info.finalUrl));
+    if (resolved.href !== url.href) {
+      url = resolved;
+      const dupe = await env.DB.prepare("SELECT id FROM products WHERE owner = ? AND url = ?")
+        .bind(owner, url.href).first();
+      if (dupe) return json({ error: "You're already tracking that product" }, 409);
+      if (info.rendered) {
+        const plain = await readProduct(url.href, env, "static");
+        if (plain.price != null) info = plain;
+      }
+    }
   }
 
   const now = Date.now();
@@ -223,7 +239,7 @@ async function checkProduct(env: Env, p: ProductRow): Promise<{ price?: number; 
   const now = Date.now();
   let info: PageInfo;
   try {
-    info = await readProduct(p.url, env, p.render === 1);
+    info = await readProduct(p.url, env, p.render === 1 ? "render" : "auto");
   } catch (err) {
     info = fail(errorMessage(err));
   }
@@ -350,6 +366,7 @@ interface PageInfo {
   availability: Availability;
   via?: string;
   rendered?: boolean;
+  finalUrl?: string;
   error?: string;
 }
 
@@ -370,27 +387,86 @@ const CURRENCY_RE = /₹|Rs\.?\s?\d|\$|€|£|¥|\b(INR|USD|EUR|GBP|JPY|AUD|CAD|
 const fail = (error: string): PageInfo =>
   ({ title: "", image: null, price: null, currency: null, availability: null, error });
 
-async function readProduct(href: string, env: Env, forceRender: boolean): Promise<PageInfo> {
-  if (!forceRender || !env.BROWSER) {
-    const res = await fetch(href, {
-      headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml", "accept-language": "en-IN,en;q=0.9" },
-      redirect: "follow",
-    });
+// Answers that mean "not now" rather than "no such page": worth retrying in
+// a real browser, which stores treat more kindly than a bare request.
+const BLOCKED = new Set([403, 405, 406, 429, 500, 502, 503, 520, 521, 522, 529]);
+
+type ReadMode = "auto" | "render" | "static";
+
+async function readProduct(href: string, env: Env, mode: ReadMode | boolean): Promise<PageInfo> {
+  if (typeof mode === "boolean") mode = mode ? "render" : "auto";
+  const canRender = mode !== "static" && !!env.BROWSER;
+  let blockedBy = 0;
+  if (mode !== "render" || !canRender) {
+    let res = await fetchPage(href);
+    // Stores sometimes answer a share link's redirect chain with an error
+    // once; a second try usually goes through.
+    if (!res.ok && BLOCKED.has(res.status)) {
+      await new Promise((r) => setTimeout(r, 1500));
+      res = await fetchPage(href);
+    }
     if (!res.ok) {
-      const blocked = res.status === 403 || res.status === 503 ? " (it may be blocking automated checks)" : "";
-      return fail(`The store answered ${res.status}${blocked}`);
+      if (!BLOCKED.has(res.status) || !canRender) {
+        const blocked = BLOCKED.has(res.status) ? " (it may be blocking automated checks)" : "";
+        return fail(`The store answered ${res.status}${blocked}`);
+      }
+      blockedBy = res.status;
+    } else {
+      if (!(res.headers.get("content-type") || "").includes("html")) {
+        return fail("That link isn't a web page");
+      }
+      const info = await parsePage(res, res.url || href);
+      info.finalUrl = res.url || href;
+      if (info.price != null || !canRender) return info;
     }
-    if (!(res.headers.get("content-type") || "").includes("html")) {
-      return fail("That link isn't a web page");
-    }
-    const info = await parsePage(res, href);
-    if (info.price != null || !env.BROWSER) return info;
   }
 
-  // Real browser, for pages that load the price with JavaScript.
+  // Real browser, for pages that load the price with JavaScript or turn
+  // away plain requests.
   const info = await renderAndParse(href, env.BROWSER as BrowserWorker);
   info.rendered = info.price != null;
+  if (info.price == null && blockedBy) {
+    info.error = `The store answered ${blockedBy} and the page didn't load in a browser either. It may be blocking automated checks.`;
+  }
   return info;
+}
+
+function fetchPage(href: string): Promise<Response> {
+  return fetch(href, {
+    headers: {
+      "user-agent": UA,
+      accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+      "accept-language": "en-IN,en;q=0.9",
+      "upgrade-insecure-requests": "1",
+    },
+    redirect: "follow",
+  });
+}
+
+/** Resolves share/short links and drops tracking parameters, so the same product is stored once. */
+async function canonicalUrl(url: URL): Promise<URL> {
+  let out = url;
+  if (/^(dl\.flipkart\.com|amzn\.in|amzn\.to|a\.co|fkrt\.(it|co|cc)|myntr\.it|bit\.ly|t\.co)$/i.test(url.hostname)) {
+    try {
+      // GET, not HEAD: some link shorteners only redirect on GET.
+      const res = await fetch(url.href, { redirect: "follow", headers: { "user-agent": UA, accept: "text/html" } });
+      await res.body?.cancel();
+      if (res.url) out = new URL(res.url);
+    } catch {
+      // keep the link as given
+    }
+  }
+  // Flipkart's /dl/ pages are the share-link landing; the product page is the same path on www.
+  if (out.hostname === "dl.flipkart.com") {
+    out.hostname = "www.flipkart.com";
+    out.pathname = out.pathname.replace(/^\/dl\//, "/");
+  }
+  const drop = /^(utm_|fm$|ctx$|lid$|hl_lid$|_refId$|_appId$|marketplace$|ref$|ref_$|tag$|th$|psc$|spm$|srsltid$|gclid$|fbclid$|mc_)/i;
+  for (const key of [...out.searchParams.keys()]) {
+    if (drop.test(key)) out.searchParams.delete(key);
+  }
+  out.hash = "";
+  return out;
 }
 
 async function renderAndParse(href: string, binding: BrowserWorker): Promise<PageInfo> {
@@ -406,7 +482,9 @@ async function renderAndParse(href: string, binding: BrowserWorker): Promise<Pag
     await page.setViewport({ width: 1280, height: 900 });
     await page.goto(href, { waitUntil: "networkidle2", timeout: 25000 });
     const html = await page.content();
-    const info = await parsePage(new Response(html, { headers: { "content-type": "text/html" } }), href);
+    const finalUrl = page.url() || href;
+    const info = await parsePage(new Response(html, { headers: { "content-type": "text/html" } }), finalUrl);
+    info.finalUrl = finalUrl;
     if (info.price != null) info.via = `browser, ${info.via}`;
     return info;
   } catch (err) {
