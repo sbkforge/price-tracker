@@ -301,12 +301,169 @@ function chart(p: Product, height: number): SVGElement {
   return svg;
 }
 
-// ---------- history sheet ----------
+// ---------- history sheet with timeline ----------
+
+const DAY = 86400000;
+let sheetProduct: Product | null = null;
+let sheetRange = 0; // days; 0 = all
+
+const dateShort = (ms: number) =>
+  new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+const dateLong = (ms: number) =>
+  new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+
+function rangeHistory(p: Product, days: number): PricePoint[] {
+  if (!days) return p.history;
+  const from = Date.now() - days * DAY;
+  const inRange = p.history.filter(([t]) => t >= from);
+  // Keep the last point before the range so the line starts at the edge.
+  const before = p.history.filter(([t]) => t < from).pop();
+  return before ? [[from, before[1]], ...inRange] : inRange;
+}
+
+// Big chart: date axis, grid, lowest/highest markers, hover or touch readout.
+function timeline(p: Product, h: PricePoint[]): SVGElement {
+  const W = 600, H = 200, L = 8, R = 8, T = 22, B = 24;
+  const svg = svgEl("svg", { class: "chart", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", role: "img" });
+  svg.style.height = `${H}px`;
+  svg.setAttribute("aria-label", `Price timeline, ${h.length} checks`);
+  const readout = $("hReadout");
+  if (h.length < 2) {
+    svg.classList.add("flat");
+    svg.append(svgEl("line", { class: "line", x1: 0, x2: W, y1: H / 2, y2: H / 2 }));
+    readout.textContent = h.length ? "Only one check so far; the line grows with each check." : "No checks in this range.";
+    return svg;
+  }
+
+  const values = h.map((x) => x[1]);
+  if (p.target != null) values.push(p.target);
+  let lo = Math.min(...values);
+  let hi = Math.max(...values);
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.08;
+  lo -= pad; hi += pad;
+  const t0 = h[0][0];
+  const t1 = h[h.length - 1][0];
+  const span = (t1 - t0) || 1;
+  const x = (t: number) => L + ((t - t0) / span) * (W - L - R);
+  const y = (v: number) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+
+  // Grid and axis labels
+  for (let i = 0; i <= 3; i++) {
+    const v = lo + ((hi - lo) * i) / 3;
+    svg.append(svgEl("line", { class: "grid", x1: L, x2: W - R, y1: y(v), y2: y(v) }));
+    const label = svgEl("text", { class: "axis", x: W - R, y: y(v) - 3, "text-anchor": "end" });
+    label.textContent = money(Math.round(v), p.currency);
+    svg.append(label);
+  }
+  const ticks = Math.min(5, Math.max(2, Math.round(span / DAY) + 1));
+  for (let i = 0; i < ticks; i++) {
+    const t = t0 + (span * i) / (ticks - 1);
+    const label = svgEl("text", {
+      class: "axis", x: x(t), y: H - 6,
+      "text-anchor": i === 0 ? "start" : i === ticks - 1 ? "end" : "middle",
+    });
+    label.textContent = span > 2 * DAY ? dateShort(t) : when(t);
+    svg.append(label);
+  }
+
+  // Line and area
+  const pts = h.map(([t, v]) => `${x(t).toFixed(1)} ${y(v).toFixed(1)}`);
+  const d = `M ${pts.join(" L ")}`;
+  const gid = `tl${p.id}`;
+  const defs = svgEl("defs", {});
+  const grad = svgEl("linearGradient", { id: gid, x1: 0, x2: 0, y1: 0, y2: 1 });
+  grad.append(svgEl("stop", { offset: "0%", class: "stop-a" }), svgEl("stop", { offset: "100%", class: "stop-b" }));
+  defs.append(grad);
+  svg.append(
+    defs,
+    svgEl("path", { class: "area", d: `${d} L ${x(t1).toFixed(1)} ${H - B} L ${x(t0).toFixed(1)} ${H - B} Z`, fill: `url(#${gid})` }),
+    svgEl("path", { class: "line", d }),
+  );
+  if (p.target != null) {
+    svg.append(svgEl("line", { class: "target", x1: L, x2: W - R, y1: y(p.target), y2: y(p.target) }));
+  }
+
+  // Lowest and highest markers (first time each was reached)
+  const lowIdx = h.findIndex(([, v]) => v === Math.min(...h.map((q) => q[1])));
+  const highIdx = h.findIndex(([, v]) => v === Math.max(...h.map((q) => q[1])));
+  for (const [idx, cls] of [[highIdx, "hi"], [lowIdx, "lo"]] as const) {
+    if (idx < 0) continue;
+    const [t, v] = h[idx];
+    svg.append(svgEl("circle", { class: `mark ${cls}`, cx: x(t), cy: y(v), r: 4 }));
+    const left = x(t) > W * 0.7;
+    const label = svgEl("text", {
+      class: `label ${cls}`, x: x(t) + (left ? -8 : 8), y: y(v) + (cls === "lo" ? 14 : -8),
+      "text-anchor": left ? "end" : "start",
+    });
+    label.textContent = `${cls === "lo" ? "Low" : "High"} ${money(v, p.currency)} · ${dateShort(t)}`;
+    svg.append(label);
+  }
+
+  // Hover / touch readout
+  const cursor = svgEl("line", { class: "cursor", x1: 0, x2: 0, y1: T, y2: H - B, visibility: "hidden" });
+  const dot = svgEl("circle", { class: "dot", cx: 0, cy: 0, r: 4, visibility: "hidden" });
+  svg.append(cursor, dot);
+  const show = (clientX: number) => {
+    const rect = svg.getBoundingClientRect();
+    const t = t0 + ((clientX - rect.left) / rect.width) * span;
+    let i = h.findIndex(([tt]) => tt > t);
+    i = i < 0 ? h.length - 1 : Math.max(0, i - 1);
+    const [tt, v] = h[i];
+    cursor.setAttribute("x1", String(x(tt)));
+    cursor.setAttribute("x2", String(x(tt)));
+    dot.setAttribute("cx", String(x(tt)));
+    dot.setAttribute("cy", String(y(v)));
+    cursor.setAttribute("visibility", "visible");
+    dot.setAttribute("visibility", "visible");
+    readout.replaceChildren(el("b", undefined, money(v, p.currency)), document.createTextNode(` · ${when(tt)}`));
+  };
+  const hide = () => {
+    cursor.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden");
+    readout.textContent = "";
+  };
+  svg.addEventListener("pointermove", (e) => show(e.clientX));
+  svg.addEventListener("pointerdown", (e) => show(e.clientX));
+  svg.addEventListener("pointerleave", hide);
+  return svg;
+}
+
+function renderHistoryChart(): void {
+  const p = sheetProduct;
+  if (!p) return;
+  const h = rangeHistory(p, sheetRange);
+  $("hChart").replaceChildren(timeline(p, h));
+  document.querySelectorAll<HTMLButtonElement>("#hRange button").forEach((b) =>
+    b.setAttribute("aria-pressed", String(Number(b.dataset.range) === sheetRange))
+  );
+
+  const lowLine = $("hLow");
+  lowLine.replaceChildren();
+  if (h.length) {
+    const minV = Math.min(...h.map((q) => q[1]));
+    const low = h.find(([, v]) => v === minV) as PricePoint;
+    const since = dateLong(p.history[0][0]);
+    lowLine.append(
+      "Lowest ", el("b", "lo", money(low[1], p.currency)), ` on ${dateLong(low[0])}`,
+      el("span", "muted", ` · tracking since ${since}`)
+    );
+  }
+}
+
+document.querySelectorAll<HTMLButtonElement>("#hRange button").forEach((b) =>
+  b.addEventListener("click", () => {
+    sheetRange = Number(b.dataset.range) || 0;
+    renderHistoryChart();
+  })
+);
 
 function openHistory(p: Product): void {
+  sheetProduct = p;
   $("hTitle").textContent = p.title;
-  $("hMeta").textContent = `${p.store} · ${p.history.length} check${p.history.length === 1 ? "" : "s"} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(p.average, p.currency)}`;
-  $("hChart").replaceChildren(chart(p, 180));
+  const avg = p.average != null && p.price != null && Number.isInteger(p.price) ? Math.round(p.average) : p.average;
+  $("hMeta").textContent = `${p.store} · ${p.history.length} check${p.history.length === 1 ? "" : "s"} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(avg, p.currency)}`;
+  renderHistoryChart();
   $<HTMLAnchorElement>("hOpen").href = p.url;
   $<HTMLAnchorElement>("hCsv").href = `/api/products/${p.id}/history.csv`;
 

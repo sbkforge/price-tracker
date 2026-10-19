@@ -299,3 +299,24 @@ button.primary.small { height: 40px; padding: 0 16px; font-size: 15px; border-ra
   .field.small input { width: 100%; }
   .sheet { width: 100vw; max-width: none; margin: auto 0 0; border-radius: 22px 22px 0 0; max-height: 92vh; padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
 }
+
+/* ---------- timeline ---------- */
+.range-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; }
+.segmented.small { margin: 0; }
+.segmented.small button { padding: 4px 10px; font-size: 12px; }
+.readout { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--muted); min-height: 1.2em; text-align: right; }
+.readout b { color: var(--text); font-weight: 600; }
+.big-chart { margin: 8px 0 4px; }
+.big-chart .chart { height: 200px; cursor: crosshair; touch-action: none; }
+.chart .axis { font-size: 11px; fill: var(--muted); }
+.chart .grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart .mark { fill: var(--surface); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.chart .mark.lo { stroke: var(--green); }
+.chart .mark.hi { stroke: var(--red); }
+.chart .label { font-size: 11px; font-weight: 600; }
+.chart .label.lo { fill: var(--green); }
+.chart .label.hi { fill: var(--red); }
+.chart .cursor { stroke: var(--text); stroke-opacity: .35; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.lowline { margin: 0 0 12px; font-size: 14px; }
+.lowline b { font-weight: 600; }
+.lowline .lo { color: var(--green); }

@@ -87,7 +87,18 @@
       <button class="close" data-close aria-label="Close">✕</button>
     </div>
     <p id="hMeta" class="muted"></p>
+    <div class="range-row">
+      <nav id="hRange" class="segmented small" aria-label="Time range">
+        <button data-range="7" aria-pressed="false">1W</button>
+        <button data-range="30" aria-pressed="false">1M</button>
+        <button data-range="90" aria-pressed="false">3M</button>
+        <button data-range="365" aria-pressed="false">1Y</button>
+        <button data-range="0" aria-pressed="true">All</button>
+      </nav>
+      <span id="hReadout" class="readout"></span>
+    </div>
     <div id="hChart" class="big-chart"></div>
+    <p id="hLow" class="lowline"></p>
     <div class="sheet-actions">
       <a id="hOpen" class="pill" target="_blank" rel="noopener">Open in store ↗</a>
       <a id="hCsv" class="pill" download>Export CSV</a>
