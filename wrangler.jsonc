@@ -10,7 +10,7 @@
   },
   // Forks: replace this id with your own from `wrangler d1 create price-tracker`.
   "d1_databases": [
-    { "binding": "DB", "database_name": "price-tracker", "database_id": "00000000-0000-0000-0000-000000000000" }
+    { "binding": "DB", "database_name": "price-tracker", "database_id": "980dd9b9-016d-4585-8448-f88c2122295e" }
   ],
   // Check prices hourly; each run re-checks products not checked in 6 hours.
   "triggers": { "crons": ["0 * * * *"] },
