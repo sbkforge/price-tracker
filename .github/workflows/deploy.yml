@@ -22,6 +22,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
       # Forks without the secrets skip the deploy instead of failing.
       - name: Deploy to Cloudflare
         if: env.CLOUDFLARE_API_TOKEN != ''

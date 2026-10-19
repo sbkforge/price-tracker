@@ -2,3 +2,5 @@ node_modules/
 .wrangler/
 .dev.vars
 .DS_Store
+public/app.js
+public/app.js.map

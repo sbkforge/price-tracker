@@ -2,15 +2,21 @@
   "name": "price-tracker",
   "version": "0.1.0",
   "private": true,
-  "description": "Track product prices from online stores, on Cloudflare Workers + D1",
+  "description": "Track product prices from online stores. TypeScript on Cloudflare Workers + D1.",
   "license": "MIT",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "build": "esbuild web/app.ts --bundle --format=esm --target=es2022 --minify --sourcemap --outfile=public/app.js",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "dev": "npm run build && wrangler dev --test-scheduled",
+    "deploy": "npm run typecheck && npm run build && wrangler deploy",
     "db:local": "wrangler d1 migrations apply price-tracker --local",
     "db:remote": "wrangler d1 migrations apply price-tracker --remote"
   },
   "devDependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
+    "@cloudflare/workers-types": "^5.20261019.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
     "wrangler": "^4.0.0"
   }
 }

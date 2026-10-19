@@ -1,0 +1,2 @@
+# Copy to .dev.vars for local dev (scripts/vapid.js writes it). Never commit .dev.vars.
+VAPID_PRIVATE_KEY=

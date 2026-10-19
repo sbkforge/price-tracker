@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "price-tracker",
-  "main": "src/worker.js",
+  "main": "src/worker.ts",
   "compatibility_date": "2026-09-01",
   "assets": {
     "directory": "./public",
@@ -14,5 +14,9 @@
   ],
   // Every 15 minutes, re-check up to 25 products not checked in 6 hours.
   "triggers": { "crons": ["*/15 * * * *"] },
+  // Public half of the VAPID key pair (the private half is a secret).
+  "vars": { "VAPID_PUBLIC_KEY": "BMoSJAb1g_2kizuw0aoooBRVBmv1Wya8p2fJIfFjDgfuGrNZVo8TueDpMJaQvMOiAJUpf2wGnp3s0A7-h8LlfsQ", "VAPID_SUBJECT": "https://price-tracker.sbk-music.workers.dev" },
+  // Free-plan Browser Rendering: a real browser for stores that load prices with JavaScript.
+  "browser": { "binding": "BROWSER" },
   "observability": { "enabled": true }
 }

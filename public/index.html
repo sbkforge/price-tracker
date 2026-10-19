@@ -2,41 +2,133 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Price Tracker</title>
-  <meta name="description" content="Track product prices from online stores and see when they drop.">
-  <meta name="theme-color" content="#111318">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏷️</text></svg>">
+  <meta name="description" content="Track product prices from online stores, see the history, and get alerts when they drop.">
+  <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Prices">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="top">
-    <h1>Price Tracker</h1>
-    <span class="muted">Your list is saved to this browser</span>
+  <header class="nav">
+    <div class="wrap">
+      <span class="brand">Price Tracker</span>
+      <div class="nav-actions">
+        <button id="alertsBtn" class="nav-btn" aria-pressed="false" title="Price drop alerts">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a5 5 0 0 0-5 5v3.1L3.6 13.2a.8.8 0 0 0 .7 1.3h11.4a.8.8 0 0 0 .7-1.3L15 10.6V7.5a5 5 0 0 0-5-5ZM8 16.5a2 2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>
+          <span id="alertsLabel">Alerts off</span>
+        </button>
+        <button id="settingsBtn" class="nav-btn" title="Sync and settings">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
   </header>
 
-  <main>
-    <form id="add" class="add">
-      <input id="url" type="url" placeholder="Paste a product link" autocomplete="off" required>
-      <input id="target" type="number" min="0" step="any" placeholder="Alert below (optional)" inputmode="decimal">
-      <button class="primary" type="submit">Track</button>
-    </form>
-    <p id="msg" class="msg" hidden></p>
+  <main class="wrap">
+    <section class="hero">
+      <h1>Prices</h1>
+      <p id="subtitle" class="subtitle">Paste a product link to start watching its price.</p>
+    </section>
 
-    <div class="bar">
-      <nav class="chips" aria-label="Filter">
+    <form id="add" class="add">
+      <div class="field grow">
+        <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5a3.5 3.5 0 0 0 4.95 0l2.12-2.12a3.5 3.5 0 0 0-4.95-4.95l-1.06 1.06M11.5 8.5a3.5 3.5 0 0 0-4.95 0L4.43 10.62a3.5 3.5 0 0 0 4.95 4.95l1.06-1.06" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <input id="url" type="url" placeholder="Paste a product link" autocomplete="off" required>
+      </div>
+      <div class="field">
+        <input id="target" type="number" min="0" step="any" placeholder="Alert below" inputmode="decimal">
+      </div>
+      <button id="track" class="primary" type="submit">Track</button>
+    </form>
+
+    <div class="toolbar">
+      <nav id="filters" class="segmented" aria-label="Filter">
         <button data-filter="all" aria-pressed="true">All</button>
-        <button data-filter="dropped" aria-pressed="false">Price dropped</button>
+        <button data-filter="dropped" aria-pressed="false">Dropped</button>
         <button data-filter="target" aria-pressed="false">Below target</button>
+        <button data-filter="out" aria-pressed="false">Out of stock</button>
       </nav>
-      <span id="count" class="muted"></span>
+      <div class="tools">
+        <div class="field small">
+          <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M13.5 13.5 17 17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <input id="search" type="search" placeholder="Search" autocomplete="off">
+        </div>
+        <select id="sort" class="select" aria-label="Sort">
+          <option value="recent">Recently added</option>
+          <option value="drop">Biggest drop</option>
+          <option value="low">Price: low to high</option>
+          <option value="high">Price: high to low</option>
+          <option value="name">Name</option>
+        </select>
+      </div>
     </div>
 
-    <p id="status" class="status">Loading…</p>
+    <div id="empty" class="empty" hidden>
+      <svg viewBox="0 0 64 64" aria-hidden="true"><path d="M34 8h18a4 4 0 0 1 4 4v18L30 56 8 34 34 8Z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/><circle cx="44" cy="20" r="4" fill="currentColor"/></svg>
+      <h2 id="emptyTitle">No products yet</h2>
+      <p id="emptyText">Add a link from any online store. We'll check its price every 6 hours.</p>
+    </div>
+
     <div id="products" class="products"></div>
 
-    <p class="credit">Free to use, no account needed. Your list lives in this browser; up to 30 products. Prices are checked every 6 hours from each store's public product data. Some stores block automated checks or load prices with JavaScript; those can't be tracked.</p>
+    <p class="footnote">Free to use, no account needed. Your list lives in this browser (use Sync to see it on another device), up to 30 products. Prices come from each store's public product data and are checked every 6 hours. Some stores block automated checks; those can't be tracked.</p>
   </main>
+
+  <dialog id="historySheet" class="sheet">
+    <div class="sheet-head">
+      <h2 id="hTitle">History</h2>
+      <button class="close" data-close aria-label="Close">✕</button>
+    </div>
+    <p id="hMeta" class="muted"></p>
+    <div id="hChart" class="big-chart"></div>
+    <div class="sheet-actions">
+      <a id="hOpen" class="pill" target="_blank" rel="noopener">Open in store ↗</a>
+      <a id="hCsv" class="pill" download>Export CSV</a>
+    </div>
+    <div class="table-wrap">
+      <table id="hTable" class="table">
+        <thead><tr><th>When</th><th class="num">Price</th><th class="num">Change</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </dialog>
+
+  <dialog id="settingsSheet" class="sheet">
+    <div class="sheet-head">
+      <h2>Sync &amp; settings</h2>
+      <button class="close" data-close aria-label="Close">✕</button>
+    </div>
+    <section class="group">
+      <h3>Use this list on another device</h3>
+      <p class="muted">Your list is tied to a sync code saved in this browser. Enter the same code on your phone or laptop to see the same products there.</p>
+      <div class="code-row">
+        <code id="syncCode"></code>
+        <button id="copyCode" class="pill">Copy</button>
+      </div>
+    </section>
+    <section class="group">
+      <h3>Switch to a code from another device</h3>
+      <form id="syncForm" class="code-row">
+        <div class="field grow"><input id="syncInput" placeholder="Paste a sync code" autocomplete="off" spellcheck="false"></div>
+        <button class="primary small" type="submit">Switch</button>
+      </form>
+      <p class="muted">This browser then shows that list instead. Nothing is deleted.</p>
+    </section>
+    <section class="group">
+      <h3>Alerts</h3>
+      <p id="alertsHelp" class="muted">Turn on alerts (bell icon at the top) to get a notification when a tracked price drops or an item is back in stock. Without a target price you're told about every drop; with one, only when the price is at or below it.</p>
+      <button id="testPush" class="pill">Send a test alert</button>
+    </section>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script src="/app.js" type="module"></script>
 </body>

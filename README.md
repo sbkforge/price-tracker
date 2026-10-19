@@ -1,18 +1,19 @@
 # Price Tracker
 
-Track product prices from online stores and see when they drop. Paste a product link, optionally set a target price, and it checks the price every 6 hours and draws the history.
+Track product prices from online stores, see the history, and get a push alert when a price drops. Paste a product link, optionally set a target price, and it checks the price every 6 hours.
 
-Runs on Cloudflare's free plan: a Worker, a D1 database and a cron trigger. No build step, no framework, no credit card.
+Written in TypeScript and runs entirely on Cloudflare's free plan: a Worker, a D1 database, a cron trigger, Browser Rendering for JavaScript-heavy stores, and Web Push with no third-party service. No accounts, no credit card.
 
 ## Features
 
-- Add any product link; it reads the name, price, currency and photo from the page
-- Price checked every 6 hours, with full history
-- Step chart of the price over time, with your target as a dashed line
-- Change since you started tracking, lowest and highest price
-- "Below target" badge and filters for price drops and hits
-- Check a product now, change its target, or stop tracking it
-- Light and dark mode, works on phones
+- Add any product link; it reads the name, price, currency, photo and stock status from the page
+- Price checked every 6 hours, with full history, a chart, and low / high / average
+- **Push alerts** when a price drops (any drop, or at or below your target) and when an item is back in stock
+- **Sync code** to see the same list on your phone and laptop; no sign-up
+- Filters (dropped, below target, out of stock), search and sort
+- History sheet with every check, and CSV export
+- Stores that fill prices in with JavaScript are read in a real browser (Cloudflare Browser Rendering)
+- Apple-style UI, light and dark mode, installable on a phone's home screen
 
 ## How it reads prices
 
@@ -21,6 +22,9 @@ Most stores publish product data for search engines. The Worker reads, in order:
 1. JSON-LD (`<script type="application/ld+json">` with a schema.org `Product` and its `offers`)
 2. Meta tags (`product:price:amount`, `og:price:amount`, `itemprop="price"`)
 3. Store-specific price elements (Amazon's buy box, Flipkart)
+4. Any element whose class or id mentions "price" and whose text looks like an amount (most common amount wins)
+
+If none of those finds a price, the page is loaded once more in a real browser (Browser Rendering) and read again; products that needed that are always checked that way.
 
 **Works well with:** most Shopify stores and many brand stores (for example boAt, Allbirds), Myntra, Amazon India.
 
@@ -32,7 +36,12 @@ Every request sends an `x-owner` header: a random 16–64 character id the page 
 
 | Route | What it does |
 |---|---|
+| `GET /api/config` | Public push key and limits |
+| `GET /api/inspect?url=` | What the reader sees on a page (for "why can't this be tracked?") |
 | `GET /api/products` | All products with price history |
+| `GET /api/products/<id>/history.csv` | Price history as CSV |
+| `POST /api/push` / `DELETE /api/push` | Turn push alerts on or off for this browser |
+| `POST /api/push/test` | Send a test alert |
 | `POST /api/products` | Track a link: `{ "url": "...", "target": 999 }` |
 | `PATCH /api/products/<id>` | Change the target: `{ "target": 899 }` |
 | `POST /api/products/<id>/check` | Check the price now |
@@ -45,8 +54,11 @@ npm install
 npx wrangler login
 npx wrangler d1 create price-tracker      # put the printed id in wrangler.jsonc
 npm run db:remote                         # create the tables
-npm run deploy
+node scripts/vapid.js                     # prints a public key for wrangler.jsonc and sets the private one
+npm run deploy                            # typecheck, build, deploy
 ```
+
+`npm run deploy` type-checks (`tsc`), bundles `web/app.ts` with esbuild into `public/app.js`, and deploys with wrangler.
 
 Open the `*.workers.dev` URL and add products. No sign-in: each visitor gets a random id kept in their browser, and their list is private to it.
 
