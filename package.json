@@ -1,0 +1,16 @@
+{
+  "name": "price-tracker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Track product prices from online stores, on Cloudflare Workers + D1",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 migrations apply price-tracker --local",
+    "db:remote": "wrangler d1 migrations apply price-tracker --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Price Tracker</title>
+  <meta name="description" content="Track product prices from online stores and see when they drop.">
+  <meta name="theme-color" content="#111318">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏷️</text></svg>">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>Price Tracker</h1>
+    <button id="settingsToggle" class="ghost" title="Admin token">Settings</button>
+  </header>
+
+  <section id="settings" class="panel" hidden>
+    <p class="hint">Adding, checking and removing products needs the admin token you set with <code>wrangler secret put ADMIN_TOKEN</code>. It is saved only in this browser.</p>
+    <label>Admin token <input id="token" type="password" autocomplete="off"></label>
+  </section>
+
+  <main>
+    <form id="add" class="add">
+      <input id="url" type="url" placeholder="Paste a product link" autocomplete="off" required>
+      <input id="target" type="number" min="0" step="any" placeholder="Alert below (optional)" inputmode="decimal">
+      <button class="primary" type="submit">Track</button>
+    </form>
+    <p id="msg" class="msg" hidden></p>
+
+    <div class="bar">
+      <nav class="chips" aria-label="Filter">
+        <button data-filter="all" aria-pressed="true">All</button>
+        <button data-filter="dropped" aria-pressed="false">Price dropped</button>
+        <button data-filter="target" aria-pressed="false">Below target</button>
+      </nav>
+      <span id="count" class="muted"></span>
+    </div>
+
+    <p id="status" class="status">Loading…</p>
+    <div id="products" class="products"></div>
+
+    <p class="credit">Prices are checked every 6 hours from each store's public product data. Some stores block automated checks or load prices with JavaScript; those can't be tracked.</p>
+  </main>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
