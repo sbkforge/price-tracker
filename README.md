@@ -28,13 +28,15 @@ Most stores publish product data for search engines. The Worker reads, in order:
 
 ## API
 
+Every request sends an `x-owner` header: a random 16–64 character id the page generates and keeps in the browser.
+
 | Route | What it does |
 |---|---|
 | `GET /api/products` | All products with price history |
-| `POST /api/products` | Track a link: `{ "url": "...", "target": 999 }` (needs token) |
-| `PATCH /api/products/<id>` | Change the target: `{ "target": 899 }` (needs token) |
-| `POST /api/products/<id>/check` | Check the price now (needs token) |
-| `DELETE /api/products/<id>` | Stop tracking (needs token) |
+| `POST /api/products` | Track a link: `{ "url": "...", "target": 999 }` |
+| `PATCH /api/products/<id>` | Change the target: `{ "target": 899 }` |
+| `POST /api/products/<id>/check` | Check the price now |
+| `DELETE /api/products/<id>` | Stop tracking |
 
 ## Deploy your own
 
@@ -43,16 +45,15 @@ npm install
 npx wrangler login
 npx wrangler d1 create price-tracker      # put the printed id in wrangler.jsonc
 npm run db:remote                         # create the tables
-npx wrangler secret put ADMIN_TOKEN       # any long random value
 npm run deploy
 ```
 
-Open the `*.workers.dev` URL, click **Settings**, paste your token, and add products.
+Open the `*.workers.dev` URL and add products. No sign-in: each visitor gets a random id kept in their browser, and their list is private to it.
 
 ### Local development
 
 ```sh
-cp .dev.vars.example .dev.vars   # set ADMIN_TOKEN
+# no secrets needed
 npm run db:local
 npx wrangler dev --test-scheduled
 curl "localhost:8787/__scheduled?cron=0+*+*+*+*"   # run the price check now
@@ -60,12 +61,12 @@ curl "localhost:8787/__scheduled?cron=0+*+*+*+*"   # run the price check now
 
 ## Free plan limits
 
-- Each scheduled run checks up to 25 products (a Worker can make 50 requests per run). With hourly runs that's about 600 checks a day, enough for 150 products every 6 hours.
+- Every 15 minutes a run re-checks up to 25 products that are older than 6 hours: about 2,400 checks a day, enough for 600 products.
 - D1 free tier: 5 GB storage, 100,000 writes a day.
 
 ## Notes
 
-- Anyone with the URL can see the tracked products. Only the token holder can add, check or remove them.
+- No accounts. Each browser gets a random owner id; products are scoped to it (up to 30 per owner). Clearing site data loses the list.
 - Respect each store's terms of use.
 
 ## License

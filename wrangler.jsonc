@@ -12,7 +12,7 @@
   "d1_databases": [
     { "binding": "DB", "database_name": "price-tracker", "database_id": "980dd9b9-016d-4585-8448-f88c2122295e" }
   ],
-  // Check prices hourly; each run re-checks products not checked in 6 hours.
-  "triggers": { "crons": ["0 * * * *"] },
+  // Every 15 minutes, re-check up to 25 products not checked in 6 hours.
+  "triggers": { "crons": ["*/15 * * * *"] },
   "observability": { "enabled": true }
 }

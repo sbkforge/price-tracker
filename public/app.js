@@ -11,17 +11,27 @@ const store = {
   },
 };
 
+// A random id per browser; the server keeps each id's list separate.
+function ownerId() {
+  let id = store.get("owner", "");
+  if (!id) {
+    const bytes = crypto.getRandomValues(new Uint8Array(24));
+    id = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    store.set("owner", id);
+  }
+  return id;
+}
+
 async function api(path, options = {}) {
   const res = await fetch(path, {
     ...options,
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${store.get("token", "")}`,
+      "x-owner": ownerId(),
       ...(options.headers || {}),
     },
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) throw new Error("Wrong or missing admin token. Set it in Settings.");
   if (!res.ok) throw new Error(data.error || `Server said ${res.status}`);
   return data;
 }
@@ -293,14 +303,5 @@ document.querySelectorAll(".chips button").forEach((b) =>
     render();
   })
 );
-
-$("settingsToggle").addEventListener("click", () => {
-  $("settings").hidden = !$("settings").hidden;
-});
-$("token").value = store.get("token", "");
-$("token").addEventListener("change", () => store.set("token", $("token").value.trim()));
-
-// Ask for the token on first visit, since every action needs it.
-if (!store.get("token", "")) $("settings").hidden = false;
 
 load();

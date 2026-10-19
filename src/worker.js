@@ -3,6 +3,8 @@
 
 const CHECK_EVERY = 6 * 60 * 60 * 1000; // re-check a product every 6 hours
 const BATCH = 25; // products per scheduled run (free plan allows 50 fetches)
+const MAX_PER_OWNER = 30;
+const OWNER_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
 export default {
   async fetch(request, env) {
@@ -11,17 +13,22 @@ export default {
       const path = url.pathname;
       const method = request.method;
 
-      if (path === "/api/products" && method === "GET") return await listProducts(env);
-      if (path === "/api/products" && method === "POST") {
-        if (!authorized(request, env)) return json({ error: "Unauthorized" }, 401);
-        return await addProduct(request, env);
+      // Every visitor sends their own random owner id; it scopes everything.
+      const owner = request.headers.get("x-owner") || "";
+      if (path.startsWith("/api/products")) {
+        if (!OWNER_RE.test(owner)) return json({ error: "Missing owner id; reload the page" }, 400);
       }
+
+      if (path === "/api/products" && method === "GET") return await listProducts(env, owner);
+      if (path === "/api/products" && method === "POST") return await addProduct(request, env, owner);
 
       const m = /^\/api\/products\/(\d+)(\/check)?$/.exec(path);
       if (m) {
-        if (!authorized(request, env)) return json({ error: "Unauthorized" }, 401);
         const id = Number(m[1]);
-        if (m[2] && method === "POST") return await checkNow(env, id);
+        const p = await env.DB.prepare("SELECT * FROM products WHERE id = ? AND owner = ?")
+          .bind(id, owner).first();
+        if (!p) return json({ error: "Not found" }, 404);
+        if (m[2] && method === "POST") return await checkNow(env, p);
         if (!m[2] && method === "PATCH") return await updateProduct(request, env, id);
         if (!m[2] && method === "DELETE") return await deleteProduct(env, id);
       }
@@ -40,15 +47,16 @@ export default {
 
 // ---------- API ----------
 
-async function listProducts(env) {
+async function listProducts(env, owner) {
   const { results: products } = await env.DB.prepare(
-    "SELECT * FROM products ORDER BY created_at DESC"
-  ).all();
+    "SELECT * FROM products WHERE owner = ? ORDER BY created_at DESC"
+  ).bind(owner).all();
 
   // Full history is small (4 checks a day), so send it all for the charts.
   const { results: rows } = await env.DB.prepare(
-    "SELECT product_id, price, checked_at FROM prices ORDER BY checked_at"
-  ).all();
+    `SELECT product_id, price, checked_at FROM prices
+     WHERE product_id IN (SELECT id FROM products WHERE owner = ?) ORDER BY checked_at`
+  ).bind(owner).all();
   const history = {};
   for (const r of rows) (history[r.product_id] ||= []).push([r.checked_at, r.price]);
 
@@ -67,7 +75,7 @@ async function listProducts(env) {
   }, 200, { "cache-control": "no-store" });
 }
 
-async function addProduct(request, env) {
+async function addProduct(request, env, owner) {
   const body = await request.json().catch(() => ({}));
   let url;
   try {
@@ -78,9 +86,14 @@ async function addProduct(request, env) {
   }
   url.hash = "";
 
-  const existing = await env.DB.prepare("SELECT id FROM products WHERE url = ?")
-    .bind(url.href).first();
+  const existing = await env.DB.prepare("SELECT id FROM products WHERE owner = ? AND url = ?")
+    .bind(owner, url.href).first();
   if (existing) return json({ error: "You're already tracking that product" }, 409);
+  const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM products WHERE owner = ?")
+    .bind(owner).first();
+  if (n >= MAX_PER_OWNER) {
+    return json({ error: `You can track up to ${MAX_PER_OWNER} products. Remove one first.` }, 429);
+  }
 
   const info = await readProduct(url.href);
   if (info.price == null) {
@@ -90,9 +103,9 @@ async function addProduct(request, env) {
   const now = Date.now();
   const target = toNumber(body.target);
   const row = await env.DB.prepare(
-    `INSERT INTO products (url, title, image, store, currency, price, target, created_at, checked_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
-  ).bind(url.href, info.title, info.image, storeName(url), info.currency, info.price,
+    `INSERT INTO products (owner, url, title, image, store, currency, price, target, created_at, checked_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
+  ).bind(owner, url.href, info.title, info.image, storeName(url), info.currency, info.price,
     target, now, now).first();
   await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
     .bind(row.id, info.price, now).run();
@@ -115,9 +128,11 @@ async function deleteProduct(env, id) {
   return json({ ok: true });
 }
 
-async function checkNow(env, id) {
-  const p = await env.DB.prepare("SELECT * FROM products WHERE id = ?").bind(id).first();
-  if (!p) return json({ error: "Not found" }, 404);
+async function checkNow(env, p) {
+  // Don't let "Check now" hammer a store: reuse a result under 10 minutes old.
+  if (p.checked_at && Date.now() - p.checked_at < 10 * 60 * 1000 && !p.error) {
+    return json({ ok: true, price: p.price, cached: true });
+  }
   const result = await checkProduct(env, p);
   return json({ ok: !result.error, ...result });
 }
@@ -382,18 +397,6 @@ function storeName(url) {
 }
 
 // ---------- helpers ----------
-
-function authorized(request, env) {
-  const expected = env.ADMIN_TOKEN;
-  if (!expected) return false;
-  const given = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-  if (given.length !== expected.length) return false;
-  let diff = 0;
-  for (let i = 0; i < given.length; i++) {
-    diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
-  }
-  return diff === 0;
-}
 
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {

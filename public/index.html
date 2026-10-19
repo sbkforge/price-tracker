@@ -12,13 +12,8 @@
 <body>
   <header class="top">
     <h1>Price Tracker</h1>
-    <button id="settingsToggle" class="ghost" title="Admin token">Settings</button>
+    <span class="muted">Your list is saved to this browser</span>
   </header>
-
-  <section id="settings" class="panel" hidden>
-    <p class="hint">Adding, checking and removing products needs the admin token you set with <code>wrangler secret put ADMIN_TOKEN</code>. It is saved only in this browser.</p>
-    <label>Admin token <input id="token" type="password" autocomplete="off"></label>
-  </section>
 
   <main>
     <form id="add" class="add">
@@ -40,7 +35,7 @@
     <p id="status" class="status">Loading…</p>
     <div id="products" class="products"></div>
 
-    <p class="credit">Prices are checked every 6 hours from each store's public product data. Some stores block automated checks or load prices with JavaScript; those can't be tracked.</p>
+    <p class="credit">Free to use, no account needed. Your list lives in this browser; up to 30 products. Prices are checked every 6 hours from each store's public product data. Some stores block automated checks or load prices with JavaScript; those can't be tracked.</p>
   </main>
 
   <script src="/app.js" type="module"></script>
