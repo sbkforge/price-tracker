@@ -57,7 +57,7 @@ Share/short links (`dl.flipkart.com`, `amzn.in`, ...) are resolved by `canonical
 
 ### Stores that work / don't
 
-JSON-LD stores (Shopify brands, Myntra, Decathlon, Flipkart product pages) work statically; Amazon.in works via selectors. Croma, Nykaa, Bewakoof and Amazon search block even the browser. `/api/compare` can only read Flipkart's search page; the others are returned in `blocked` and the page shows search links instead.
+JSON-LD stores (Shopify brands, Myntra, Zepto, Vijay Sales, Samsung, Apple, Decathlon, Flipkart product pages) work statically; Amazon.in via buy-box selectors; Blinkit, Instamart and Tata CLiQ only after Browser Rendering (non-HTML or empty static answers fall through to it). `BLOCKED_STORES` (Croma, Reliance Digital, Nykaa, Ajio, Meesho, BigBasket, Snapdeal) refuse even the browser: they're added through the bookmark `snapshot` in `POST /api/products` (`cleanSnapshot`/`recordSnapshot`), and their scheduled checks fail with a message pointing at the bookmark. `marketplace` hosts skip the generic `[class*=price]` guesses so an unavailable Amazon listing can't pick up an accessory's price. `/api/compare` can only read Flipkart's search page; the others are returned in `blocked` and the page shows search links instead. Free-plan Browser Rendering allows a few new sessions per minute; back-to-back renders get 429 and the test marks them skipped.
 
 ### Database
 
@@ -70,3 +70,5 @@ D1 `price-tracker` (id in `wrangler.jsonc`). Tables: `products` (one row per own
 - Verdicts ("Great price" ... "Wait") and the "inflated MRP" check are computed client-side in `verdict()` from `history`, `lowest`, `average`; they need >= 3 checks.
 - Charts are inline SVG (`chart()` for cards, `timeline()` in the History sheet). Keep `preserveAspectRatio="none"` plus `vector-effect: non-scaling-stroke`.
 - Apple-style UI: tokens in `:root` with a dark-mode override, `[hidden] { display: none !important }` so JS toggles always win.
+- Icons are Lucide (`lucide` vanilla package, tree-shaken by esbuild): `icon(name)` / `pill(name, label)` in `web/app.ts`; static markup uses `<i class="ic" data-icon="bell"></i>` placeholders that are hydrated on load. Add new icons to the `ICONS` map.
+- `BOOKMARKLET_SRC` in `web/app.ts` is the "Track price" bookmark: plain ES5, no dependencies, runs on the store's page and opens `/?capture=<json>`. Keep it that way (store CSPs block fetch; navigation always works).

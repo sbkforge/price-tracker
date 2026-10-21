@@ -203,7 +203,11 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
     return json({ error: `You can track up to ${MAX_PER_OWNER} products. Remove one first.` }, 429);
   }
 
-  let info = await readProduct(url.href, env, "auto");
+  // With a snapshot in hand, don't make the person wait on a store that is
+  // known to refuse us; otherwise try a quick plain read (no browser) first.
+  let info: PageInfo = snapshot && BLOCKED_STORES.test(url.hostname)
+    ? fail("blocked")
+    : await readProduct(url.href, env, snapshot ? "static" : "auto");
   if (info.price == null && snapshot) {
     // The Worker couldn't read the page, but the person's browser could.
     info = {
@@ -262,8 +266,13 @@ function cleanSnapshot(s: Snapshot | undefined): Snapshot | null {
   const price = toNumber(s.price);
   if (price == null || !(price > 0)) return null;
   const listPrice = toNumber(s.listPrice);
+  // Page titles carry store chrome: "Buy X Online - Croma", "X | Nykaa".
+  const title = s.title
+    ? String(s.title).replace(/\s+/g, " ").replace(/^buy\s+/i, "").replace(/\s+online\b.*$/i, "")
+      .replace(/\s+[-|–:]\s+[^-|–:]{2,40}$/, "").trim().slice(0, 200)
+    : "";
   return {
-    title: s.title ? String(s.title).replace(/\s+/g, " ").trim().slice(0, 200) : undefined,
+    title: title || undefined,
     price,
     currency: s.currency && /^[A-Z]{3}$/.test(String(s.currency)) ? String(s.currency) : null,
     image: s.image && /^https?:\/\//.test(String(s.image)) ? String(s.image).slice(0, 500) : null,

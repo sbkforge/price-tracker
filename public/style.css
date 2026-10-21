@@ -430,3 +430,33 @@ button.primary.small { height: 40px; padding: 0 16px; font-size: 15px; border-ra
   .score-row { grid-template-columns: 100px 1fr; }
   .gauge-svg { width: 100px; height: 60px; }
 }
+
+/* ---------- Lucide icons, examples, skeletons ---------- */
+.ic { display: inline-flex; vertical-align: -0.15em; line-height: 0; }
+.ic .lucide { width: 1em; height: 1em; }
+.brand { display: inline-flex; align-items: center; gap: 7px; }
+.brand-ic { color: var(--blue); }
+.brand-ic .lucide { width: 20px; height: 20px; }
+.field-ic { color: var(--muted); flex: none; }
+.field-ic .lucide { width: 18px; height: 18px; }
+.nav-btn .ic .lucide { width: 20px; height: 20px; }
+.mic .ic .lucide { width: 18px; height: 18px; }
+.pill { display: inline-flex; align-items: center; gap: 5px; }
+.pill .lucide { width: 14px; height: 14px; }
+.close .ic .lucide { width: 14px; height: 14px; }
+.segmented button .ic { margin-right: 2px; color: #f97316; }
+.tip .ic { color: #f59e0b; }
+.linkish { color: var(--blue); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+.empty-ic { color: var(--blue); opacity: .9; }
+.empty-ic .lucide { width: 56px; height: 56px; }
+.examples { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-items: center; margin-top: 18px; }
+.examples .muted { margin: 0; }
+
+.card.skeleton { min-height: 300px; position: relative; overflow: hidden; }
+.card.skeleton::before {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, var(--fill) 50%, transparent 100%);
+  animation: shimmer 1.4s infinite;
+}
+@keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .card.skeleton::before { animation: none; } }

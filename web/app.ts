@@ -1,9 +1,44 @@
 // Price Tracker page. Built with esbuild into public/app.js.
 
+import {
+  createElement as lucide, Bell, BellRing, BookmarkPlus, Check, Copy, Download, ExternalLink, Flame, History,
+  Lightbulb, Link, MessageCircle, Mic, Plus, RefreshCw, Search, Settings, Share2, ShoppingBag, SlidersHorizontal,
+  Tag, Tags, Trash2, Undo2, X,
+} from "lucide";
+import type { IconNode } from "lucide";
 import type {
   CheckResponse, CompareHit, CompareResponse, ConfigResponse, Deal, DealsResponse, ListResponse,
   PricePoint, Product, ShareResponse, Snapshot, UpdateRequest,
 } from "../src/shared";
+
+// ---------- icons (Lucide) ----------
+
+const ICONS: Record<string, IconNode> = {
+  bell: Bell, "bell-ring": BellRing, "bookmark-plus": BookmarkPlus, check: Check, copy: Copy, download: Download,
+  "external-link": ExternalLink, flame: Flame, history: History, lightbulb: Lightbulb, link: Link,
+  "message-circle": MessageCircle, mic: Mic, plus: Plus, "refresh-cw": RefreshCw, search: Search,
+  settings: Settings, "share-2": Share2, "shopping-bag": ShoppingBag, "sliders-horizontal": SlidersHorizontal,
+  tag: Tag, tags: Tags, "trash-2": Trash2, "undo-2": Undo2, x: X,
+};
+
+function icon(name: keyof typeof ICONS, size = 16): SVGElement {
+  const svg = lucide(ICONS[name], { width: size, height: size, "stroke-width": 2, "aria-hidden": "true" });
+  svg.classList.add("lucide");
+  return svg;
+}
+
+// <i class="ic" data-icon="bell"></i> placeholders in the HTML become SVGs.
+document.querySelectorAll<HTMLElement>("i.ic[data-icon]").forEach((i) => {
+  const name = i.dataset.icon as keyof typeof ICONS;
+  if (ICONS[name]) i.replaceChildren(icon(name, i.classList.contains("empty-ic") ? 56 : i.classList.contains("brand-ic") ? 20 : 16));
+});
+
+/** A pill button with a Lucide icon in front of its label. */
+function pill(name: keyof typeof ICONS, label: string, cls = "pill"): HTMLButtonElement {
+  const b = el("button", cls);
+  b.append(icon(name, 14), document.createTextNode(` ${label}`));
+  return b;
+}
 
 type Filter = "all" | "dropped" | "alerts" | "target" | "out" | "bought" | "deals";
 type Sort = "recent" | "drop" | "score" | "low" | "high" | "name";
@@ -292,11 +327,23 @@ function visible(list: Product[]): Product[] {
   return shown.sort(by[state.sort]);
 }
 
-function setEmpty(show: boolean, title = "", text = ""): void {
+function setEmpty(show: boolean, title = "", text = "", examples = false): void {
   $("empty").hidden = !show;
   $("emptyTitle").textContent = title;
   $("emptyText").textContent = text;
+  $("examples").hidden = !examples;
 }
+
+document.querySelectorAll<HTMLButtonElement>("[data-example]").forEach((b) =>
+  b.addEventListener("click", () => {
+    $<HTMLInputElement>("url").value = b.dataset.example || "";
+    $<HTMLInputElement>("url").dispatchEvent(new Event("input"));
+    $<HTMLFormElement>("add").requestSubmit();
+  })
+);
+document.querySelectorAll<HTMLButtonElement>("[data-open-settings]").forEach((b) =>
+  b.addEventListener("click", () => $("settingsBtn").click())
+);
 
 function render(): void {
   document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
@@ -322,11 +369,13 @@ function render(): void {
     : shared ? "This list is empty." : "Paste a product link to start watching its price, or type a product name to search.";
 
   const noneAtAll = all.length === 0;
+  $("skeleton").hidden = state.loaded || shared;
   setEmpty(state.loaded && shown.length === 0,
     noneAtAll ? "No products yet" : "Nothing here",
     noneAtAll
       ? "Add a link from any online store, or search a product by name. We'll check prices every 6 hours."
-      : "No tracked product matches this filter.");
+      : "No tracked product matches this filter.",
+    noneAtAll && !shared);
   $("products").replaceChildren(...shown.map((p) => card(p, shared)));
 }
 
@@ -350,6 +399,7 @@ async function runSearch(query: string): Promise<void> {
 
 function renderSearch(): void {
   const s = state.search;
+  $("skeleton").hidden = !s.loading;
   $("heading").textContent = "Search";
   $("subtitle").textContent = "Pick a result to track it, or paste a link from any store.";
   $("searchTitle").textContent = s.loading ? `Searching for “${s.query}”…` : `Results for “${s.query}”`;
@@ -376,7 +426,7 @@ function hitCard(h: CompareHit): HTMLElement {
   row.append(el("span", "price", money(h.price, h.currency || "INR")));
   const foot = el("div", "card-foot");
   const mine = state.products.find((p) => p.url === h.url);
-  const track = el("button", "pill", mine ? "Tracking ✓" : "Track this");
+  const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track this");
   track.disabled = !!mine;
   track.addEventListener("click", () => trackUrl(h.url, track));
   foot.append(el("span", "spacer"), track);
@@ -415,9 +465,10 @@ $("voice").addEventListener("click", () => {
 async function renderDeals(): Promise<void> {
   $("heading").textContent = "Deals";
   $("subtitle").textContent = "Biggest price drops in the last 7 days, across everything people track here.";
+  $("skeleton").hidden = !!state.deals;
   if (!state.deals) {
     $("products").replaceChildren();
-    setEmpty(true, "Loading deals…", "");
+    setEmpty(false);
     try {
       const data = await api<DealsResponse>("/api/deals");
       state.deals = data.deals;
@@ -426,6 +477,7 @@ async function renderDeals(): Promise<void> {
       state.deals = [];
     }
     if (state.filter !== "deals" || state.mode === "search") return;
+    $("skeleton").hidden = true;
   }
 
   // Category chips from what's actually on offer.
@@ -494,7 +546,7 @@ function dealCard(d: Deal): HTMLElement {
   const foot = el("div", "card-foot");
   const stamp = el("span", "muted", `Dropped ${ago(d.checked_at)}`);
   const mine = state.products.some((p) => p.url === d.url);
-  const track = el("button", "pill", mine ? "Tracking ✓" : "Track this");
+  const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track this");
   track.disabled = mine;
   track.addEventListener("click", () => trackUrl(d.url, track));
   foot.append(stamp, el("span", "spacer"), track);
@@ -504,16 +556,16 @@ function dealCard(d: Deal): HTMLElement {
 
 async function trackUrl(url: string, button: HTMLButtonElement): Promise<void> {
   button.disabled = true;
-  button.textContent = "Adding…";
+  button.replaceChildren(icon("refresh-cw", 14), " Adding…");
   try {
     await api("/api/products", { method: "POST", body: JSON.stringify({ url }) });
     toast("Added to your list", "success");
-    button.textContent = "Tracking ✓";
+    button.replaceChildren(icon("check", 14), " Tracking");
     await load();
   } catch (err) {
     toast((err as Error).message, "error");
     button.disabled = false;
-    button.textContent = "Track this";
+    button.replaceChildren(icon("plus", 14), " Track this");
   }
 }
 
@@ -574,10 +626,10 @@ function card(p: Product, readOnly = false): HTMLElement {
 
   const foot = el("div", "card-foot");
   if (readOnly) {
-    const history = el("button", "pill", "History");
+    const history = pill("history", "History");
     history.addEventListener("click", () => openHistory(p, true));
     const mine = state.products.some((x) => x.url === p.url);
-    const track = el("button", "pill", mine ? "Tracking ✓" : "Track this");
+    const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track this");
     track.disabled = mine;
     track.addEventListener("click", () => trackUrl(p.url, track));
     foot.append(history, el("span", "spacer"), track);
@@ -598,15 +650,15 @@ function card(p: Product, readOnly = false): HTMLElement {
   target.addEventListener("change", () => setTarget(p, target.value));
   label.append(target);
 
-  const history = el("button", "pill", "History");
+  const history = pill("history", "History");
   history.addEventListener("click", () => openHistory(p));
-  const check = el("button", "pill", "Check");
+  const check = pill("refresh-cw", "Check");
   check.title = "Check the price now";
   check.addEventListener("click", () => checkNow(p, check));
-  const bought = el("button", "pill", p.bought_at ? "Not bought" : "Bought");
+  const bought = pill(p.bought_at ? "undo-2" : "shopping-bag", p.bought_at ? "Not bought" : "Bought");
   bought.title = p.bought_at ? "Clear the purchase" : "Mark as bought and add it to your Spend";
   bought.addEventListener("click", () => markBought(p));
-  const remove = el("button", "pill danger", "Remove");
+  const remove = pill("trash-2", "Remove", "pill danger");
   remove.addEventListener("click", () => removeProduct(p));
   foot.append(label, history, check, bought, remove);
   c.append(foot);
@@ -882,7 +934,7 @@ function hitRow(h: { title: string; url: string; store: string; image: string | 
   const cheaper = h.price != null && compareTo != null && h.price < compareTo;
   right.append(el("span", `p ${cheaper ? "cheaper" : ""}`, money(h.price, h.currency || "INR")));
   const mine = state.products.some((x) => x.url === h.url);
-  const track = el("button", "pill", mine ? "Tracking ✓" : "Track");
+  const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track");
   track.disabled = mine;
   track.addEventListener("click", () => trackUrl(h.url, track));
   right.append(track);
@@ -1091,7 +1143,7 @@ async function markBought(p: Product): Promise<void> {
 
 async function checkNow(p: Product, button: HTMLButtonElement): Promise<void> {
   button.disabled = true;
-  button.textContent = "Checking…";
+  button.replaceChildren(icon("refresh-cw", 14), " Checking…");
   try {
     const r = await api<CheckResponse>(`/api/products/${p.id}/check`, { method: "POST" });
     if (r.error) toast(`${p.title}: ${r.error}`, "error");
@@ -1100,7 +1152,7 @@ async function checkNow(p: Product, button: HTMLButtonElement): Promise<void> {
   } catch (err) {
     toast((err as Error).message, "error");
     button.disabled = false;
-    button.textContent = "Check";
+    button.replaceChildren(icon("refresh-cw", 14), " Check");
   }
 }
 
