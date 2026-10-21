@@ -469,3 +469,4 @@ button.primary.small { height: 40px; padding: 0 16px; font-size: 15px; border-ra
 .sheet-alert .target .ic { color: var(--blue); }
 .sheet-alert .target input { width: 110px; background: var(--surface); }
 .sheet-alert .muted { margin: 0; font-size: 13px; }
+.chart .hold { stroke: var(--blue); stroke-opacity: .45; stroke-width: 2; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
