@@ -3,7 +3,7 @@
 //
 //   node scripts/e2e.mjs                      # http://localhost:8787
 //   node scripts/e2e.mjs http://localhost:8797
-//   node scripts/e2e.mjs https://price-tracker.sbk-music.workers.dev
+//   node scripts/e2e.mjs https://price-tracker.sbkforge.workers.dev
 //
 // Adds real products from Amazon.in, Flipkart and a few brand stores under a
 // throwaway owner, checks every API the page uses, then removes them.

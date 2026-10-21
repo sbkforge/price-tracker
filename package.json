@@ -12,7 +12,7 @@
     "db:local": "wrangler d1 migrations apply price-tracker --local",
     "db:remote": "wrangler d1 migrations apply price-tracker --remote",
     "test": "node scripts/e2e.mjs http://localhost:8787",
-    "test:live": "node scripts/e2e.mjs https://price-tracker.sbk-music.workers.dev"
+    "test:live": "node scripts/e2e.mjs https://price-tracker.sbkforge.workers.dev"
   },
   "devDependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A price tracker on Cloudflare's free plan: paste a product link, the Worker reads the price from the page, re-checks it on a cron, and sends Web Push alerts when it drops. TypeScript end to end, no framework, no accounts. Live at https://price-tracker.sbk-music.workers.dev; repo `sbkforge/price-tracker`.
+A price tracker on Cloudflare's free plan: paste a product link, the Worker reads the price from the page, re-checks it on a cron, and sends Web Push alerts when it drops. TypeScript end to end, no framework, no accounts. Live at https://price-tracker.sbkforge.workers.dev; repo `sbkforge/price-tracker`.
 
 ## Commands
 
