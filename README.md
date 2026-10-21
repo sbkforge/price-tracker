@@ -9,6 +9,10 @@ Written in TypeScript and runs entirely on Cloudflare's free plan: a Worker, a D
 - Add any product link; it reads the name, price, currency, photo and stock status from the page
 - Price checked every 6 hours, with full history, a chart, and low / high / average
 - **Push alerts** when a price drops (any drop, or at or below your target) and when an item is back in stock
+- **Buy or Wait verdict** per product, judged from its own history (lowest, average), plus "% off MRP" with an inflated-MRP warning
+- **Deals feed**: biggest drops in the last 7 days across everything people track (product facts only, never who tracks what)
+- **Compare stores**: Flipkart results inline, one-tap search links for Amazon, Croma, Reliance Digital, Vijay Sales and Tata CLiQ
+- **Share to app**: on Android, share a product link from any app straight into Price Tracker (Web Share Target)
 - **Sync code** to see the same list on your phone and laptop; no sign-up
 - Filters (dropped, below target, out of stock), search and sort
 - History sheet with every check, and CSV export
@@ -37,6 +41,8 @@ Every request sends an `x-owner` header: a random 16–64 character id the page 
 | Route | What it does |
 |---|---|
 | `GET /api/config` | Public push key and limits |
+| `GET /api/deals` | Public feed of the biggest drops in the last 7 days |
+| `GET /api/compare?q=` | Search other stores for a product name |
 | `GET /api/inspect?url=` | What the reader sees on a page (for "why can't this be tracked?") |
 | `GET /api/products` | All products with price history |
 | `GET /api/products/<id>/history.csv` | Price history as CSV |

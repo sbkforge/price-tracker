@@ -54,6 +54,7 @@
         <button data-filter="dropped" aria-pressed="false">Dropped</button>
         <button data-filter="target" aria-pressed="false">Below target</button>
         <button data-filter="out" aria-pressed="false">Out of stock</button>
+        <button data-filter="deals" aria-pressed="false">🔥 Deals</button>
       </nav>
       <div class="tools">
         <div class="field small">
@@ -99,10 +100,16 @@
     </div>
     <div id="hChart" class="big-chart"></div>
     <p id="hLow" class="lowline"></p>
+    <div id="hVerdict" class="verdict"></div>
     <div class="sheet-actions">
       <a id="hOpen" class="pill" target="_blank" rel="noopener">Open in store ↗</a>
+      <button id="hCompare" class="pill">Compare stores</button>
       <a id="hCsv" class="pill" download>Export CSV</a>
     </div>
+    <section id="hComparePanel" class="compare" hidden>
+      <div id="hCompareLinks" class="store-links"></div>
+      <div id="hCompareHits" class="hits"></div>
+    </section>
     <div class="table-wrap">
       <table id="hTable" class="table">
         <thead><tr><th>When</th><th class="num">Price</th><th class="num">Change</th></tr></thead>

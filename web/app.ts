@@ -1,8 +1,10 @@
 // Price Tracker page. Built with esbuild into public/app.js.
 
-import type { CheckResponse, ConfigResponse, ListResponse, PricePoint, Product } from "../src/shared";
+import type {
+  CheckResponse, CompareResponse, ConfigResponse, Deal, DealsResponse, ListResponse, PricePoint, Product,
+} from "../src/shared";
 
-type Filter = "all" | "dropped" | "target" | "out";
+type Filter = "all" | "dropped" | "target" | "out" | "deals";
 type Sort = "recent" | "drop" | "low" | "high" | "name";
 
 const state = {
@@ -12,6 +14,7 @@ const state = {
   query: "",
   loaded: false,
   config: null as ConfigResponse | null,
+  deals: null as Deal[] | null,
 };
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
@@ -116,6 +119,38 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return e;
 }
 
+// ---------- buy-or-wait verdict ----------
+//
+// Judged only from what this tracker has seen: the current price against
+// the lowest and the average so far. Needs a few checks before it speaks.
+
+type Verdict = { kind: "great" | "good" | "fair" | "wait" | "new"; label: string; why: string };
+
+function verdict(p: Product): Verdict {
+  const n = p.history.length;
+  if (p.price == null || n < 3 || p.lowest == null || p.average == null) {
+    return { kind: "new", label: "Building history", why: `${n} check${n === 1 ? "" : "s"} so far. The verdict needs a few more.` };
+  }
+  const vsAvg = (p.price - p.average) / p.average;
+  const vsLow = (p.price - p.lowest) / p.lowest;
+  const cur = money(p.price, p.currency);
+  const avg = money(Math.round(p.average), p.currency);
+  if (vsLow <= 0.005 && vsAvg <= -0.03) {
+    return { kind: "great", label: "Great price", why: `${cur} is the lowest seen and ${Math.round(-vsAvg * 100)}% under the average of ${avg}.` };
+  }
+  if (vsAvg <= -0.01) {
+    return { kind: "good", label: "Good price", why: `${cur} is ${Math.round(-vsAvg * 100)}% under the average of ${avg}; the lowest seen was ${money(p.lowest, p.currency)}.` };
+  }
+  if (vsAvg >= 0.05) {
+    return { kind: "wait", label: "Wait", why: `${cur} is ${Math.round(vsAvg * 100)}% above the average of ${avg}. It has been as low as ${money(p.lowest, p.currency)}.` };
+  }
+  return { kind: "fair", label: "Fair price", why: `${cur} is around the average of ${avg}. Lowest seen: ${money(p.lowest, p.currency)}.` };
+}
+
+// An MRP far above anything the product ever sold for is marketing, not a saving.
+const inflatedList = (p: Product): boolean =>
+  p.list_price != null && p.highest != null && p.history.length >= 3 && p.list_price > p.highest * 1.6;
+
 // ---------- rendering ----------
 
 const isDropped = (p: Product): boolean => p.first != null && p.price != null && p.price < p.first;
@@ -145,6 +180,14 @@ function visible(): Product[] {
 }
 
 function render(): void {
+  document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter))
+  );
+  if (state.filter === "deals") {
+    void renderDeals();
+    return;
+  }
+
   const all = state.products;
   const shown = visible();
 
@@ -160,10 +203,88 @@ function render(): void {
     : "Add a link from any online store. We'll check its price every 6 hours.";
 
   $("products").replaceChildren(...shown.map(card));
+}
 
-  document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
-    b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter))
+// ---------- deals feed ----------
+
+async function renderDeals(): Promise<void> {
+  $("subtitle").textContent = "Biggest price drops in the last 7 days, across everything people track here.";
+  $("empty").hidden = true;
+  if (!state.deals) {
+    $("products").replaceChildren();
+    $("emptyTitle").textContent = "Loading deals…";
+    $("emptyText").textContent = "";
+    $("empty").hidden = false;
+    try {
+      const data = await api<DealsResponse>("/api/deals");
+      state.deals = data.deals;
+    } catch (err) {
+      toast(`Could not load deals: ${(err as Error).message}`, "error");
+      state.deals = [];
+    }
+    if (state.filter !== "deals") return;
+  }
+  const q = state.query.toLowerCase();
+  const list = state.deals.filter((d) => !q || `${d.title} ${d.store}`.toLowerCase().includes(q));
+  $("empty").hidden = list.length > 0;
+  $("emptyTitle").textContent = "No deals yet";
+  $("emptyText").textContent = "Deals show up here when a tracked product's price falls. Check back after a few checks.";
+  $("products").replaceChildren(...list.map(dealCard));
+}
+
+function dealCard(d: Deal): HTMLElement {
+  const c = el("article", "card deal");
+  const top = el("div", "card-top");
+  const frame = el("div", "photo");
+  if (d.image) {
+    const img = el("img");
+    img.src = d.image;
+    img.alt = "";
+    img.loading = "lazy";
+    img.referrerPolicy = "no-referrer";
+    img.onerror = () => img.remove();
+    frame.append(img);
+  }
+  const info = el("div", "info");
+  const title = el("a", "title", d.title);
+  title.href = d.url;
+  title.target = "_blank";
+  title.rel = "noopener";
+  info.append(title, el("div", "store", d.store));
+  top.append(frame, info);
+
+  const row = el("div", "price-row");
+  row.append(
+    el("span", "price", money(d.price, d.currency)),
+    el("span", "was", money(d.was, d.currency)),
+    el("span", "drop-big", `−${d.drop_pct}%`)
   );
+  if (d.list_price) row.append(el("span", "chip off", `${Math.round((1 - d.price / d.list_price) * 100)}% off MRP`));
+
+  const foot = el("div", "card-foot");
+  const stamp = el("span", "muted", `Dropped ${ago(d.checked_at)}`);
+  const mine = state.products.some((p) => p.url === d.url);
+  const track = el("button", "pill", mine ? "Tracking ✓" : "Track this");
+  track.disabled = mine;
+  track.addEventListener("click", () => trackUrl(d.url, track));
+  foot.append(stamp, el("span", "spacer"), track);
+  c.append(top, row, foot);
+  return c;
+}
+
+async function trackUrl(url: string, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  button.textContent = "Adding…";
+  try {
+    await api("/api/products", { method: "POST", body: JSON.stringify({ url }) });
+    toast("Added to your list", "success");
+    button.textContent = "Tracking ✓";
+    await load();
+  } catch (err) {
+    toast((err as Error).message, "error");
+    button.disabled = false;
+    button.textContent = "Track this";
+  }
 }
 
 function card(p: Product): HTMLElement {
@@ -202,8 +323,18 @@ function card(p: Product): HTMLElement {
     row.append(chip);
   }
   if (isHit(p)) row.append(el("span", "chip hit", "Below target"));
-  else if (p.history.length > 2 && p.price != null && p.price === p.lowest) {
+  const v = verdict(p);
+  if (v.kind !== "new") {
+    const chip = el("span", `chip ${v.kind}`, v.label);
+    chip.title = v.why;
+    row.append(chip);
+  } else if (p.history.length > 2 && p.price != null && p.price === p.lowest) {
     row.append(el("span", "chip low", "Lowest yet"));
+  }
+  if (p.list_price && p.price != null && !inflatedList(p)) {
+    const off = el("span", "chip off");
+    off.append(el("s", undefined, money(p.list_price, p.currency)), ` ${Math.round((1 - p.price / p.list_price) * 100)}% off`);
+    row.append(off);
   }
   if (p.availability === "out_of_stock") row.append(el("span", "chip stock out", "Out of stock"));
   else if (p.availability === "preorder") row.append(el("span", "chip stock", "Pre-order"));
@@ -458,8 +589,93 @@ document.querySelectorAll<HTMLButtonElement>("#hRange button").forEach((b) =>
   })
 );
 
+// ---------- compare across stores ----------
+
+const STORE_SEARCH: Array<[string, (q: string) => string]> = [
+  ["Amazon.in", (q) => `https://www.amazon.in/s?k=${encodeURIComponent(q)}`],
+  ["Flipkart", (q) => `https://www.flipkart.com/search?q=${encodeURIComponent(q)}`],
+  ["Croma", (q) => `https://www.croma.com/searchB?q=${encodeURIComponent(q)}`],
+  ["Reliance Digital", (q) => `https://www.reliancedigital.in/products?q=${encodeURIComponent(q)}`],
+  ["Vijay Sales", (q) => `https://www.vijaysales.com/search/${encodeURIComponent(q)}`],
+  ["Tata CLiQ", (q) => `https://www.tatacliq.com/search/?searchCategory=all&text=${encodeURIComponent(q)}`],
+];
+
+// "Apple MacBook Pro (M5 Pro, 2026) M5 Pro - (24 GB/1 TB SSD/Tahoe) MGEA4HN/A" -> short search words
+function searchWords(title: string): string {
+  return title
+    .replace(/\|.*$/, "")
+    .replace(/[()[\]{}\-–—,/]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !/^(with|and|the|for|of|a|an|in|by)$/i.test(w))
+    .slice(0, 8)
+    .join(" ");
+}
+
+async function openCompare(p: Product): Promise<void> {
+  const panel = $("hComparePanel");
+  panel.hidden = !panel.hidden;
+  if (panel.hidden) return;
+  const q = searchWords(p.title);
+  const links = $("hCompareLinks");
+  links.replaceChildren(...STORE_SEARCH.map(([name, make]) => {
+    const a = el("a", undefined, `${name} ↗`);
+    a.href = make(q);
+    a.target = "_blank";
+    a.rel = "noopener";
+    return a;
+  }));
+  const hits = $("hCompareHits");
+  hits.replaceChildren(el("p", "muted", "Looking on Flipkart…"));
+  try {
+    const data = await api<CompareResponse>(`/api/compare?q=${encodeURIComponent(q)}`);
+    hits.replaceChildren();
+    const found = data.hits.filter((h) => h.url !== p.url);
+    if (!found.length) {
+      hits.append(el("p", "muted", data.blocked.includes("flipkart.com")
+        ? "Flipkart didn't answer just now. Use the store links above."
+        : "No close matches found. Use the store links above."));
+    }
+    for (const h of found) {
+      const row = el("div", "hit");
+      const img = el("img");
+      img.src = h.image || "";
+      img.alt = "";
+      img.referrerPolicy = "no-referrer";
+      const mid = el("div");
+      const t = el("a", "t", h.title);
+      t.href = h.url;
+      t.target = "_blank";
+      t.rel = "noopener";
+      mid.append(t, el("div", "s", h.store));
+      const right = el("div", "hit-right");
+      const cheaper = h.price != null && p.price != null && h.price < p.price;
+      right.append(el("span", `p ${cheaper ? "cheaper" : ""}`, money(h.price, h.currency || p.currency)));
+      const mine = state.products.some((x) => x.url === h.url);
+      const track = el("button", "pill", mine ? "Tracking ✓" : "Track");
+      track.disabled = mine;
+      track.addEventListener("click", () => trackUrl(h.url, track));
+      right.append(track);
+      row.append(img, mid, right);
+      hits.append(row);
+    }
+    hits.append(el("p", "muted", "Other stores block automatic lookups; their links open a search."));
+  } catch (err) {
+    hits.replaceChildren(el("p", "muted", `Couldn't compare: ${(err as Error).message}`));
+  }
+}
+
+$("hCompare").addEventListener("click", () => { if (sheetProduct) openCompare(sheetProduct); });
+
 function openHistory(p: Product): void {
   sheetProduct = p;
+  $("hComparePanel").hidden = true;
+  const v = verdict(p);
+  const box = $("hVerdict");
+  box.dataset.kind = v.kind;
+  box.replaceChildren(el("b", undefined, v.label), el("span", "why", v.why));
+  if (inflatedList(p)) {
+    box.append(el("span", "why", `The listed MRP of ${money(p.list_price, p.currency)} is far above any price seen here, so the "% off" is mostly marketing.`));
+  }
   $("hTitle").textContent = p.title;
   const avg = p.average != null && p.price != null && Number.isInteger(p.price) ? Math.round(p.average) : p.average;
   $("hMeta").textContent = `${p.store} · ${p.history.length} check${p.history.length === 1 ? "" : "s"} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(avg, p.currency)}`;
@@ -571,9 +787,21 @@ async function removeProduct(p: Product): Promise<void> {
 document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
   b.addEventListener("click", () => {
     state.filter = (b.dataset.filter as Filter) || "all";
+    if (state.filter === "deals") state.deals = null; // refresh each visit
     render();
   })
 );
+
+// Shared to the app from another app (Web Share Target), or opened with ?url=.
+function handleSharedLink(): void {
+  const params = new URLSearchParams(location.search);
+  const text = [params.get("url"), params.get("text"), params.get("title")].filter(Boolean).join(" ");
+  const link = /https?:\/\/\S+/.exec(text || "")?.[0];
+  if (!link) return;
+  history.replaceState(null, "", "/");
+  $<HTMLInputElement>("url").value = link;
+  $<HTMLFormElement>("add").requestSubmit();
+}
 $<HTMLInputElement>("search").addEventListener("input", (e) => {
   state.query = (e.target as HTMLInputElement).value.trim();
   render();
@@ -707,6 +935,6 @@ state.sort = (["recent", "drop", "low", "high", "name"] as Sort[]).includes(stor
   ? (store.get("sort", "recent") as Sort) : "recent";
 $<HTMLSelectElement>("sort").value = state.sort;
 
-load();
+load().then(handleSharedLink);
 fetch("/api/config").then((r) => r.json()).then((c: ConfigResponse) => { state.config = c; }).catch(() => {});
 currentSubscription().then((s) => setAlertsUi(!!s)).catch(() => {});

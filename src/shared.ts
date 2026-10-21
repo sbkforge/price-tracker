@@ -15,6 +15,8 @@ export interface ProductRow {
   target: number | null;
   error: string | null;
   availability: Availability;
+  /** List price / MRP from the page, when the store shows one. */
+  list_price: number | null;
   /** 1 when the page needs a real browser (prices loaded with JavaScript). */
   render: number;
   created_at: number;
@@ -51,6 +53,41 @@ export interface CheckResponse {
   price?: number;
   cached?: boolean;
   error?: string;
+}
+
+/** A product in the public Deals feed: biggest recent drops across everyone, no owner info. */
+export interface Deal {
+  url: string;
+  title: string;
+  image: string | null;
+  store: string;
+  currency: string | null;
+  price: number;
+  was: number;
+  list_price: number | null;
+  drop_pct: number;
+  checked_at: number;
+}
+
+export interface DealsResponse {
+  deals: Deal[];
+}
+
+/** One result from another store, for the Compare panel. */
+export interface CompareHit {
+  store: string;
+  title: string;
+  url: string;
+  price: number | null;
+  currency: string | null;
+  image: string | null;
+}
+
+export interface CompareResponse {
+  query: string;
+  hits: CompareHit[];
+  /** Stores that couldn't be searched automatically; the page shows a search link instead. */
+  blocked: string[];
 }
 
 export interface ConfigResponse {

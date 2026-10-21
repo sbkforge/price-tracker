@@ -41,6 +41,9 @@ export default {
         });
       }
 
+      // Public: biggest recent price drops across everyone (no owner info).
+      if (path === "/api/deals" && method === "GET") return await deals(env);
+
       // Every visitor sends their own random owner id; it scopes everything.
       const owner = request.headers.get("x-owner") || "";
       if (path.startsWith("/api/")) {
@@ -53,6 +56,10 @@ export default {
         if (!/^https?:\/\//.test(target)) return json({ error: "Give a full link" }, 400);
         const info = await readProduct(target, env, url.searchParams.get("render") === "1" ? "render" : "auto");
         return json({ ...info, canonical: (await canonicalUrl(new URL(target))).href, image: info.image ? "(found)" : null }, 200, { "cache-control": "no-store" });
+      }
+
+      if (path === "/api/compare" && method === "GET") {
+        return await compare(url.searchParams.get("q") || "");
       }
 
       if (path === "/api/products" && method === "GET") return await listProducts(env, owner);
@@ -173,10 +180,10 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
   const now = Date.now();
   const target = toNumber(body.target);
   const row = await env.DB.prepare(
-    `INSERT INTO products (owner, url, title, image, store, currency, price, target, availability, render, created_at, checked_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
+    `INSERT INTO products (owner, url, title, image, store, currency, price, target, availability, list_price, render, created_at, checked_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
   ).bind(owner, url.href, info.title, info.image, storeName(url), info.currency, info.price,
-    target, info.availability, info.rendered ? 1 : 0, now, now).first<{ id: number }>();
+    target, info.availability, info.listPrice, info.rendered ? 1 : 0, now, now).first<{ id: number }>();
   if (!row) throw new Error("Could not save the product");
   await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
     .bind(row.id, info.price, now).run();
@@ -224,6 +231,91 @@ async function historyCsv(env: Env, p: ProductRow): Promise<Response> {
   });
 }
 
+// ---------- deals feed ----------
+//
+// Products anyone tracks whose price fell in the last 7 days, biggest drop
+// first. Only product facts are shared, never who tracks what.
+
+async function deals(env: Env): Promise<Response> {
+  const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM (
+       SELECT p.url, p.title, p.image, p.store, p.currency, p.price, p.list_price, p.checked_at,
+              (SELECT MAX(price) FROM prices WHERE product_id = p.id AND checked_at >= ?) AS was
+       FROM products p
+       WHERE p.price IS NOT NULL AND p.error IS NULL AND p.checked_at >= ?
+     )
+     WHERE was IS NOT NULL AND was > price
+     ORDER BY (was - price) * 1.0 / was DESC
+     LIMIT 200`
+  ).bind(since, since).all<{
+    url: string; title: string; image: string | null; store: string; currency: string | null;
+    price: number; list_price: number | null; checked_at: number; was: number;
+  }>();
+  // The same product tracked by several people appears once, with its biggest drop.
+  const seen = new Set<string>();
+  const list = [];
+  for (const r of results) {
+    if (seen.has(r.url)) continue;
+    seen.add(r.url);
+    list.push({ ...r, drop_pct: Math.round(((r.was - r.price) / r.was) * 100) });
+    if (list.length >= 40) break;
+  }
+  return json({ deals: list }, 200, { "cache-control": "public, max-age=300" });
+}
+
+// ---------- compare across stores ----------
+//
+// Searches other stores for the same product. Only Flipkart's search page
+// can be read without a browser; stores that block are reported so the page
+// can offer a search link instead.
+
+async function compare(raw: string): Promise<Response> {
+  const q = raw.replace(/[|()[\]{}"']/g, " ").replace(/\s+/g, " ").trim().split(" ").slice(0, 10).join(" ");
+  if (q.length < 3) return json({ error: "Nothing to search for" }, 400);
+
+  const hits = [];
+  const blocked: string[] = ["amazon.in", "croma.com", "reliancedigital.in", "vijaysales.com", "tatacliq.com"];
+  try {
+    const res = await fetchPage(`https://www.flipkart.com/search?q=${encodeURIComponent(q)}&marketplace=FLIPKART`);
+    if (res.ok) hits.push(...parseFlipkartSearch(await res.text()));
+    else blocked.unshift("flipkart.com");
+  } catch {
+    blocked.unshift("flipkart.com");
+  }
+  return json({ query: q, hits: hits.slice(0, 6), blocked }, 200, { "cache-control": "public, max-age=900" });
+}
+
+function parseFlipkartSearch(html: string) {
+  const out = [];
+  // Each result sits in a <div data-id="..."> card with the link, image and price.
+  const cards = html.split(/<div data-id="/).slice(1, 40);
+  const seen = new Set<string>();
+  for (const card of cards) {
+    const link = /href="(\/[^"]*\/p\/itm[^"]*)"/.exec(card);
+    const img = /<img[^>]+alt="([^"]{5,200})"[^>]+src="([^"]+)"/.exec(card) || /<img[^>]+src="([^"]+)"[^>]+alt="([^"]{5,200})"/.exec(card);
+    const price = /₹\s?([0-9][0-9,]{2,})/.exec(card.replace(/<[^>]+>/g, " "));
+    if (!link || !img) continue;
+    const href = link[1].replace(/&amp;/g, "&");
+    const pid = /pid=([A-Z0-9]+)/.exec(href)?.[1] || href.split("?")[0];
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const alt = img[0].startsWith("<img") && /alt="/.test(img[0].split("src=")[0]) ? img[1] : img[2];
+    const src = img[0].startsWith("<img") && /alt="/.test(img[0].split("src=")[0]) ? img[2] : img[1];
+    const url = new URL(href, "https://www.flipkart.com");
+    for (const key of [...url.searchParams.keys()]) if (key !== "pid") url.searchParams.delete(key);
+    out.push({
+      store: "flipkart.com",
+      title: decodeEntities(alt),
+      url: url.href,
+      price: price ? parsePrice(price[1]) : null,
+      currency: price ? "INR" : null,
+      image: src.replace(/&amp;/g, "&"),
+    });
+  }
+  return out;
+}
+
 // ---------- scheduled checks ----------
 
 async function checkDue(env: Env): Promise<void> {
@@ -255,8 +347,9 @@ async function checkProduct(env: Env, p: ProductRow): Promise<{ price?: number; 
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE products SET price = ?, currency = COALESCE(?, currency), error = NULL, availability = ?,
-       render = MAX(render, ?), checked_at = ?, image = COALESCE(image, ?) WHERE id = ?`
-    ).bind(info.price, info.currency, info.availability, info.rendered ? 1 : 0, now, info.image, p.id),
+       list_price = COALESCE(?, list_price), render = MAX(render, ?), checked_at = ?, image = COALESCE(image, ?)
+       WHERE id = ?`
+    ).bind(info.price, info.currency, info.availability, info.listPrice, info.rendered ? 1 : 0, now, info.image, p.id),
     env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
       .bind(p.id, info.price, now),
   ]);
@@ -364,6 +457,7 @@ interface PageInfo {
   price: number | null;
   currency: string | null;
   availability: Availability;
+  listPrice: number | null;
   via?: string;
   rendered?: boolean;
   finalUrl?: string;
@@ -384,8 +478,20 @@ const PRICE_SELECTORS =
 
 const CURRENCY_RE = /₹|Rs\.?\s?\d|\$|€|£|¥|\b(INR|USD|EUR|GBP|JPY|AUD|CAD|AED|SGD)\b/i;
 
+// Elements that never have an end tag; HTMLRewriter's onEndTag throws on them.
+const VOID_TAGS = new Set([
+  "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+  "param", "source", "track", "wbr",
+]);
+
 const fail = (error: string): PageInfo =>
-  ({ title: "", image: null, price: null, currency: null, availability: null, error });
+  ({ title: "", image: null, price: null, currency: null, availability: null, listPrice: null, error });
+
+// Struck-out list prices: Amazon's basis price, Flipkart's strike price.
+const LIST_PRICE_SELECTORS =
+  "#corePriceDisplay_desktop_feature_div .basisPrice .a-offscreen, #apex_desktop .basisPrice .a-offscreen, " +
+  "#listPrice, #priceblock_listprice, .a-price.a-text-price[data-a-strike] .a-offscreen, " +
+  "div.yRaY8j, div._3I9_wc, ._2p6lqe";
 
 // Answers that mean "not now" rather than "no such page": worth retrying in
 // a real browser, which stores treat more kindly than a bare request.
@@ -501,6 +607,7 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     itemprop: null as string | null,
     availability: null as string | null,
     selectors: [] as string[],
+    listSelectors: [] as string[],
     guesses: [] as string[],
     title: "",
     image: null as string | null,
@@ -508,6 +615,8 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
   let ldText = "";
   let selText = "";
   let inSel = 0;
+  let listText = "";
+  let inList = 0;
   const guessText: Array<(s: string) => void> = [];
 
   await new HTMLRewriter()
@@ -537,6 +646,7 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     })
     .on(PRICE_SELECTORS, {
       element(e) {
+        if (VOID_TAGS.has(e.tagName)) return;
         inSel++;
         e.onEndTag(() => {
           inSel--;
@@ -546,6 +656,18 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
       },
       text(t) { if (inSel) selText += t.text; },
     })
+    .on(LIST_PRICE_SELECTORS, {
+      element(e) {
+        if (VOID_TAGS.has(e.tagName)) return;
+        inList++;
+        e.onEndTag(() => {
+          inList--;
+          if (listText.trim()) found.listSelectors.push(listText.trim());
+          listText = "";
+        });
+      },
+      text(t) { if (inList) listText += t.text; },
+    })
     // 4. Last resort: any element whose class or id mentions "price". Only
     //    texts that look like an amount with a currency are kept.
     .on('[class*="price"], [class*="Price"], [id*="price"], [id*="Price"], [data-price]', {
@@ -553,6 +675,8 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
         if (found.guesses.length >= 40) return;
         const data = e.getAttribute("data-price");
         if (data && parsePrice(data)) found.guesses.push(data);
+        // <input class="...price..."> and friends have no end tag to wait for.
+        if (VOID_TAGS.has(e.tagName)) return;
         let txt = "";
         e.onEndTag(() => {
           txt = txt.replace(/\s+/g, " ").trim();
@@ -576,7 +700,7 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     .transform(res)
     .arrayBuffer();
 
-  const out: PageInfo = { title: "", image: null, price: null, currency: null, availability: null };
+  const out: PageInfo = { title: "", image: null, price: null, currency: null, availability: null, listPrice: null };
 
   // 1. JSON-LD
   for (const raw of found.ld) {
@@ -586,10 +710,13 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     out.image ||= firstImage(product.image);
     const offer = pickOffer(product.offers);
     if (offer && out.price == null) {
-      const spec = offer.priceSpecification || {};
-      out.price = toNumber(offer.price ?? offer.lowPrice ?? spec.price);
-      out.currency = offer.priceCurrency || spec.priceCurrency || null;
+      const specs = ([] as Json[]).concat(offer.priceSpecification || []);
+      const sale = specs.find((s) => !/ListPrice|StrikethroughPrice/i.test(s.priceType || "")) || {};
+      const list = specs.find((s) => /ListPrice|StrikethroughPrice/i.test(s.priceType || ""));
+      out.price = toNumber(offer.price ?? offer.lowPrice ?? sale.price);
+      out.currency = offer.priceCurrency || sale.priceCurrency || null;
       out.availability = availabilityOf(offer.availability);
+      out.listPrice = toNumber(list?.price);
       out.via = "json-ld";
     }
   }
@@ -602,6 +729,8 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     if (out.price != null) out.via = "meta";
   }
   out.availability ||= availabilityOf(meta["product:availability"] || meta["og:availability"] || found.availability);
+  out.listPrice ??= toNumber(meta["product:original_price:amount"] ?? meta["og:price:standard_amount"]);
+  if (out.listPrice == null && found.listSelectors.length) out.listPrice = parsePrice(found.listSelectors[0]);
 
   // 3. store-specific elements
   if (out.price == null && found.selectors.length) {
@@ -634,6 +763,8 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     try { out.image = new URL(out.image, href).href; } catch { out.image = null; }
   }
   if (out.price != null && !(out.price > 0)) out.price = null;
+  // A list price only means something if it's above the selling price.
+  if (out.listPrice != null && (out.price == null || out.listPrice <= out.price)) out.listPrice = null;
   if (out.price == null) {
     out.error = "Couldn't find a price on that page. The store may load prices with JavaScript or block automated checks.";
     // Leave clues for /api/inspect.
