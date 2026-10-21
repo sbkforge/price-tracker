@@ -106,15 +106,23 @@ for (const p of PRODUCTS) {
 {
   const b = BLOCKED_SNAPSHOT;
   const plain = await api("/api/products", { method: "POST", body: { url: b.url } });
-  ok("Blocked store without the bookmark explains what to do", plain.status === 422 && /bookmark/i.test(plain.data.error || ""), (plain.data.error || "").slice(0, 90));
-  const snap = await api("/api/products", { method: "POST", body: { url: b.url, snapshot: b.snapshot } });
-  if (ok(`${b.name}: added from the snapshot`, snap.status === 201 && snap.data.price === b.snapshot.price && snap.data.via === "bookmark", JSON.stringify(snap.data))) {
-    added.push({ name: b.name, url: b.url, id: snap.data.id, currency: "INR", min: 100000, max: 200000, snapshot: true });
+  if (plain.status === 201) {
+    // The bot wall let the browser through this time; the product is real, so keep it.
+    skipped("Blocked store without the bookmark explains what to do", `Croma answered the browser today: ${plain.data.price} INR via ${plain.data.via}`);
+    added.push({ name: "Croma iPhone (read directly)", url: b.url, id: plain.data.id, currency: "INR", min: 100000, max: 200000, snapshot: true });
     const again = await api("/api/products", { method: "POST", body: { url: b.url, snapshot: { ...b.snapshot, price: 129900 } } });
-    ok("Bookmark on the same page records a new price", again.status === 200 && again.data.updated === true && again.data.price === 129900, JSON.stringify(again.data));
-    const { data } = await api("/api/products");
-    const p = data.products.find((x) => x.id === snap.data.id);
-    ok("Snapshot product has two history points and the list price", p && p.history.length === 2 && p.price === 129900 && p.list_price === 139900 && p.highest === 134900);
+    ok("Bookmark on a tracked page records a new price", again.status === 200 && again.data.updated === true && again.data.price === 129900, JSON.stringify(again.data));
+  } else {
+    ok("Blocked store without the bookmark explains what to do", plain.status === 422 && /bookmark/i.test(plain.data.error || ""), `${plain.status} ${(plain.data.error || "").slice(0, 90)}`);
+    const snap = await api("/api/products", { method: "POST", body: { url: b.url, snapshot: b.snapshot } });
+    if (ok(`${b.name}: added from the snapshot`, snap.status === 201 && snap.data.price === b.snapshot.price && snap.data.via === "bookmark", JSON.stringify(snap.data))) {
+      added.push({ name: b.name, url: b.url, id: snap.data.id, currency: "INR", min: 100000, max: 200000, snapshot: true });
+      const again = await api("/api/products", { method: "POST", body: { url: b.url, snapshot: { ...b.snapshot, price: 129900 } } });
+      ok("Bookmark on the same page records a new price", again.status === 200 && again.data.updated === true && again.data.price === 129900, JSON.stringify(again.data));
+      const { data } = await api("/api/products");
+      const p = data.products.find((x) => x.id === snap.data.id);
+      ok("Snapshot product has two history points and the list price", p && p.history.length === 2 && p.price === 129900 && p.list_price === 139900 && p.highest === 134900);
+    }
   }
 }
 

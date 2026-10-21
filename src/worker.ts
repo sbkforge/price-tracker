@@ -268,11 +268,7 @@ function cleanSnapshot(s: Snapshot | undefined): Snapshot | null {
   const price = toNumber(s.price);
   if (price == null || !(price > 0)) return null;
   const listPrice = toNumber(s.listPrice);
-  // Page titles carry store chrome: "Buy X Online - Croma", "X | Nykaa".
-  const title = s.title
-    ? String(s.title).replace(/\s+/g, " ").replace(/^buy\s+/i, "").replace(/\s+online\b.*$/i, "")
-      .replace(/\s+[-|–:]\s+[^-|–:]{2,40}$/, "").trim().slice(0, 200)
-    : "";
+  const title = s.title ? cleanTitle(String(s.title)) : "";
   return {
     title: title || undefined,
     price,
@@ -993,8 +989,9 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     }
   }
 
-  out.title = (out.title || meta["og:title"] || meta["twitter:title"] || decodeEntities(found.title))
-    .replace(/\s+/g, " ").trim().slice(0, 200) || new URL(href).hostname;
+  out.title = (out.title ? out.title.replace(/\s+/g, " ").trim().slice(0, 200)
+    : cleanTitle(meta["og:title"] || meta["twitter:title"] || decodeEntities(found.title)))
+    || new URL(href).hostname;
   out.image ||= meta["og:image"] || meta["twitter:image"] || found.image || null;
   if (out.image) {
     try { out.image = new URL(out.image, href).href; } catch { out.image = null; }
@@ -1110,6 +1107,17 @@ function currencyFromSymbol(s: string): string | null {
   if (/¥/.test(s)) return "JPY";
   if (/\$/.test(s)) return "USD";
   return null;
+}
+
+// Page titles carry store chrome: "Buy X Online - Croma", "X | Nykaa",
+// "X : Amazon.in: Electronics". JSON-LD names don't, so they're left alone.
+function cleanTitle(s: string): string {
+  return s.replace(/\s+/g, " ")
+    .replace(/^buy\s+/i, "")
+    .replace(/\s+online\b.*$/i, "")
+    .replace(/\s*[-|–:]\s*(amazon\.in|flipkart\.com|croma|nykaa|ajio|meesho|bigbasket|snapdeal|reliance digital|tata cliq|vijay sales|myntra)\b.*$/i, "")
+    .replace(/\s+[-|–]\s+[^-|–]{2,40}$/, "")
+    .trim().slice(0, 200);
 }
 
 function decodeEntities(s: string): string {
