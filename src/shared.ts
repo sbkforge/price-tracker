@@ -22,8 +22,28 @@ export interface ProductRow {
   /** Set when the person marked it as bought. */
   bought_at: number | null;
   bought_price: number | null;
+  /** When past prices were pulled from the Wayback Machine; null until done. */
+  backfilled_at: number | null;
   created_at: number;
   checked_at: number | null;
+}
+
+/** POST /api/open: a product by link, public, with the site-wide history. */
+export interface OpenResponse {
+  product: Product;
+  /** The visitor's own row for this url, if they set an alert on it. */
+  mineId: number | null;
+  /** True while the archive lookup is still running in the background. */
+  pending: boolean;
+}
+
+export interface BackfillResponse {
+  ok: boolean;
+  /** Snapshots that yielded a price and were new to the history. */
+  added: number;
+  /** Snapshots found in the archive for this page. */
+  snapshots: number;
+  earliest: number | null;
 }
 
 /** [checked_at, price] */
@@ -31,7 +51,10 @@ export type PricePoint = [number, number];
 
 /** What GET /api/products returns for each product. */
 export interface Product extends ProductRow {
+  /** Every price point for this url from anyone who tracked it, plus archive snapshots. */
   history: PricePoint[];
+  /** How many of those points came from the Wayback Machine. */
+  archived: number;
   lowest: number | null;
   highest: number | null;
   average: number | null;

@@ -21,13 +21,13 @@ export interface Env {
 }
 
 const CHECK_EVERY = 6 * 60 * 60 * 1000; // re-check a product every 6 hours
-const BATCH = 20; // products per scheduled run (free plan allows 50 fetches; discovery needs a few)
+const BATCH = 15; // urls per scheduled run (free plan allows 50 fetches; discovery and backfill need the rest)
 const OWNER_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
 export default {
-  async fetch(request, env): Promise<Response> {
+  async fetch(request, env, ctx): Promise<Response> {
     try {
       const url = new URL(request.url);
       const path = url.pathname;
@@ -76,8 +76,12 @@ export default {
       }
 
       if (path === "/api/products" && method === "GET") return await listProducts(env, owner);
-      if (path === "/api/products" && method === "POST") return await addProduct(request, env, owner);
+      if (path === "/api/products" && method === "POST") return await addProduct(request, env, owner, ctx);
+      // Open any product link: it joins the public catalog if new, and comes
+      // back with the site-wide history. Nothing is added to the person's list.
+      if (path === "/api/open" && method === "POST") return await openProduct(request, env, owner, ctx);
       if (path === "/api/share" && method === "GET") return await shareLink(env, owner, url.origin);
+      if (path === "/api/backfill" && method === "POST") return await backfillRoute(request, env);
 
       if (path === "/api/push" && method === "POST") return await subscribe(request, env, owner);
       if (path === "/api/push" && method === "DELETE") return await unsubscribe(request, env, owner);
@@ -100,7 +104,7 @@ export default {
         if (m[2] === "/check" && method === "POST") return await checkNow(env, p);
         if (m[2] === "/history.csv" && method === "GET") return await historyCsv(env, p);
         if (!m[2] && method === "PATCH") return await updateProduct(request, env, id);
-        if (!m[2] && method === "DELETE") return await deleteProduct(env, id);
+        if (!m[2] && method === "DELETE") return await deleteProduct(env, p);
       }
 
       if (path.startsWith("/api/")) return json({ error: "Not found" }, 404);
@@ -111,7 +115,7 @@ export default {
   },
 
   async scheduled(_event, env, ctx): Promise<void> {
-    ctx.waitUntil(checkDue(env).then(() => discover(env)));
+    ctx.waitUntil(checkDue(env).then(() => discover(env)).then(() => backfillDue(env)));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -125,32 +129,47 @@ async function productsFor(env: Env, owner: string): Promise<Product[]> {
   const { results: rows } = await env.DB.prepare(
     "SELECT * FROM products WHERE owner = ? ORDER BY created_at DESC"
   ).bind(owner).all<ProductRow>();
+  const history = await historyByUrl(env, "SELECT url FROM products WHERE owner = ?", [owner]);
+  return rows.map((p) => withHistory(p, history.get(p.url)));
+}
 
-  // Full history is small (4 checks a day), so send it all for the charts.
-  const { results: points } = await env.DB.prepare(
-    `SELECT product_id, price, checked_at FROM prices
-     WHERE product_id IN (SELECT id FROM products WHERE owner = ?) ORDER BY checked_at`
-  ).bind(owner).all<{ product_id: number; price: number; checked_at: number }>();
-  const history = new Map<number, PricePoint[]>();
-  for (const r of points) {
-    const list = history.get(r.product_id) ?? [];
-    list.push([r.checked_at, r.price]);
-    history.set(r.product_id, list);
+// History is site-wide: every price point anyone's check, bookmark or an
+// archive snapshot ever produced for this url, whoever holds the row.
+const ARCHIVE_OWNER = "archive";
+
+interface HistoryRow { url: string; price: number; checked_at: number; source: string | null }
+
+async function historyByUrl(env: Env, urlSubquery: string, binds: unknown[]): Promise<Map<string, HistoryRow[]>> {
+  const { results } = await env.DB.prepare(
+    `SELECT p.url, pr.price, pr.checked_at, pr.source FROM prices pr
+     JOIN products p ON p.id = pr.product_id
+     WHERE p.url IN (${urlSubquery}) ORDER BY pr.checked_at`
+  ).bind(...binds).all<HistoryRow>();
+  const map = new Map<string, HistoryRow[]>();
+  for (const r of results) {
+    const list = map.get(r.url) ?? [];
+    // Two rows checked in the same run produce twins; keep one.
+    const last = list[list.length - 1];
+    if (last && last.price === r.price && r.checked_at - last.checked_at < 10 * 60 * 1000) continue;
+    list.push(r);
+    map.set(r.url, list);
   }
+  return map;
+}
 
-  return rows.map((p) => {
-    const h = history.get(p.id) ?? [];
-    const values = h.map((x) => x[1]);
-    const n = values.length;
-    return {
-      ...p,
-      history: h,
-      lowest: n ? Math.min(...values) : null,
-      highest: n ? Math.max(...values) : null,
-      average: n ? Math.round((values.reduce((a, b) => a + b, 0) / n) * 100) / 100 : null,
-      first: n ? values[0] : null,
-    };
-  });
+function withHistory(p: ProductRow, rows: HistoryRow[] | undefined): Product {
+  const h: PricePoint[] = (rows ?? []).map((r) => [r.checked_at, r.price]);
+  const values = h.map((x) => x[1]);
+  const n = values.length;
+  return {
+    ...p,
+    history: h,
+    archived: (rows ?? []).filter((r) => r.source === "wayback").length,
+    lowest: n ? Math.min(...values) : null,
+    highest: n ? Math.max(...values) : null,
+    average: n ? Math.round((values.reduce((a, b) => a + b, 0) / n) * 100) / 100 : null,
+    first: n ? values[0] : null,
+  };
 }
 
 // ---------- shared lists ----------
@@ -176,7 +195,7 @@ async function sharedList(env: Env, token: string): Promise<Response> {
   return json({ products }, 200, { "cache-control": "no-store" });
 }
 
-async function addProduct(request: Request, env: Env, owner: string): Promise<Response> {
+async function addProduct(request: Request, env: Env, owner: string, ctx: ExecutionContext): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as Partial<AddRequest>;
   let url: URL;
   try {
@@ -203,6 +222,33 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
     .bind(owner).first<{ n: number }>();
   if ((count?.n ?? 0) >= MAX_PER_OWNER) {
     return json({ error: `You can track up to ${MAX_PER_OWNER} products. Remove one first.` }, 429);
+  }
+
+  // Already known to the site (someone else, the catalog, or an archived row):
+  // no fetch, and the whole history comes along.
+  const known = await env.DB.prepare(
+    "SELECT * FROM products WHERE url = ? AND price IS NOT NULL ORDER BY checked_at DESC LIMIT 1"
+  ).bind(url.href).first<ProductRow>();
+  if (known) {
+    const now = Date.now();
+    const row = await env.DB.prepare(
+      `INSERT INTO products (owner, url, title, image, store, currency, price, target, availability, list_price, render, backfilled_at, created_at, checked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
+    ).bind(owner, known.url, known.title, known.image, known.store, known.currency, known.price, toNumber(body.target),
+      known.availability, known.list_price, known.render, known.backfilled_at, now, known.checked_at).first<{ id: number }>();
+    if (!row) throw new Error("Could not save the product");
+    // A url known only from an old row that lost its points still needs one.
+    const points = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM prices pr JOIN products p ON p.id = pr.product_id WHERE p.url = ?"
+    ).bind(known.url).first<{ n: number }>();
+    if (!points?.n) {
+      await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
+        .bind(row.id, known.price, known.checked_at ?? now).run();
+    }
+    if (snapshot) {
+      await recordSnapshot(env, { ...known, id: row.id, owner, target: toNumber(body.target), bought_at: null, bought_price: null }, snapshot);
+    }
+    return json({ ok: true, id: row.id, price: snapshot ? snapshot.price : known.price, currency: known.currency, via: snapshot ? "bookmark" : "shared" }, 201);
   }
 
   // With a snapshot in hand, don't make the person wait on a store that is
@@ -253,10 +299,79 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
   ).bind(owner, url.href, info.title, info.image, storeName(url), info.currency, info.price,
     target, info.availability, info.listPrice, info.rendered ? 1 : 0, now, now).first<{ id: number }>();
   if (!row) throw new Error("Could not save the product");
-  await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
-    .bind(row.id, info.price, now).run();
+  await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at, source) VALUES (?, ?, ?, ?)")
+    .bind(row.id, info.price, now, info.via === "bookmark" ? "bookmark" : null).run();
+
+  // New to the site: fetch its past from the archive right away, after the
+  // reply has gone out, so the chart is already long on the first visit.
+  const saved: ProductRow = {
+    id: row.id, owner, url: url.href, title: info.title, image: info.image, store: storeName(url), currency: info.currency,
+    price: info.price, target, error: null, availability: info.availability, list_price: info.listPrice,
+    render: info.rendered ? 1 : 0, bought_at: null, bought_price: null, backfilled_at: null, created_at: now, checked_at: now,
+  };
+  ctx.waitUntil(backfill(env, saved, 10).catch(() => undefined));
 
   return json({ ok: true, id: row.id, price: info.price, currency: info.currency, via: info.via }, 201);
+}
+
+async function openProduct(request: Request, env: Env, owner: string, ctx: ExecutionContext): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as { url?: string };
+  let url: URL;
+  try {
+    url = new URL(String(body.url || "").trim());
+    if (!/^https?:$/.test(url.protocol)) throw new Error();
+  } catch {
+    return json({ error: "Paste a full product link starting with https://" }, 400);
+  }
+  url = await canonicalUrl(url);
+
+  let known = await env.DB.prepare(
+    "SELECT * FROM products WHERE url = ? AND price IS NOT NULL ORDER BY CASE owner WHEN ? THEN 0 ELSE 1 END, checked_at DESC LIMIT 1"
+  ).bind(url.href, owner).first<ProductRow>();
+
+  if (!known) {
+    let info = await readProduct(url.href, env, "auto");
+    if (info.price == null) {
+      const hint = BLOCKED_STORES.test(url.hostname)
+        ? ` ${storeName(url)} blocks automatic checks. Open the product page and use the "Track price" bookmark (in Settings) to add it from your browser.`
+        : "";
+      return json({ error: (info.error || "Couldn't find a price on that page") + hint }, 422);
+    }
+    if (info.finalUrl && info.finalUrl !== url.href) {
+      const resolved = await canonicalUrl(new URL(info.finalUrl));
+      if (resolved.href !== url.href) {
+        url = resolved;
+        const again = await env.DB.prepare("SELECT * FROM products WHERE url = ? AND price IS NOT NULL LIMIT 1")
+          .bind(url.href).first<ProductRow>();
+        if (again) known = again;
+        else if (info.rendered) {
+          const plain = await readProduct(url.href, env, "static");
+          if (plain.price != null) info = plain;
+        }
+      }
+    }
+    if (!known) {
+      const now = Date.now();
+      const row = await env.DB.prepare(
+        `INSERT INTO products (owner, url, title, image, store, currency, price, availability, list_price, render, created_at, checked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(CATALOG_OWNER, url.href, info.title, info.image, storeName(url), info.currency, info.price,
+        info.availability, info.listPrice, info.rendered ? 1 : 0, now, now).first<ProductRow>();
+      if (!row) throw new Error("Could not save the product");
+      await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
+        .bind(row.id, info.price, now).run();
+      known = row;
+    }
+  }
+
+  // Past prices from the archive, once per url, after the reply goes out.
+  if (!known.backfilled_at) ctx.waitUntil(backfill(env, known, 10).catch(() => undefined));
+
+  const mine = known.owner === owner ? known : await env.DB.prepare("SELECT * FROM products WHERE url = ? AND owner = ?")
+    .bind(known.url, owner).first<ProductRow>();
+  const history = (await historyByUrl(env, "?", [known.url])).get(known.url);
+  const product = withHistory({ ...known, owner: "", target: mine?.target ?? null, bought_at: mine?.bought_at ?? null, bought_price: mine?.bought_price ?? null }, history);
+  return json({ product, mineId: mine?.id ?? null, pending: !known.backfilled_at }, 200, { "cache-control": "no-store" });
 }
 
 // Stores known to turn away Cloudflare, headless browser included. Their
@@ -281,20 +396,29 @@ function cleanSnapshot(s: Snapshot | undefined): Snapshot | null {
 
 async function recordSnapshot(env: Env, p: ProductRow, s: Snapshot): Promise<void> {
   const now = Date.now();
+  const followers = await followersOf(env, p.url);
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE products SET price = ?, currency = COALESCE(?, currency), error = NULL,
        availability = COALESCE(?, availability), list_price = COALESCE(?, list_price),
-       image = COALESCE(image, ?), title = COALESCE(?, title), checked_at = ? WHERE id = ?`
-    ).bind(s.price, s.currency ?? null, s.availability ?? null, s.listPrice ?? null, s.image ?? null, s.title ?? null, now, p.id),
-    env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
+       image = COALESCE(image, ?), title = COALESCE(?, title), checked_at = ? WHERE url = ?`
+    ).bind(s.price, s.currency ?? null, s.availability ?? null, s.listPrice ?? null, s.image ?? null, s.title ?? null, now, p.url),
+    env.DB.prepare("INSERT INTO prices (product_id, price, checked_at, source) VALUES (?, ?, ?, 'bookmark')")
       .bind(p.id, s.price, now),
   ]);
   const info: PageInfo = {
     title: s.title || p.title, image: s.image ?? p.image, price: s.price, currency: s.currency ?? p.currency,
     availability: s.availability ?? p.availability, listPrice: s.listPrice ?? null,
   };
-  await alertIfNeeded(env, p, info);
+  for (const f of followers) await alertIfNeeded(env, f, info);
+}
+
+/** Everyone with this product on their list (not the catalog or archived rows). */
+async function followersOf(env: Env, url: string): Promise<ProductRow[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM products WHERE url = ? AND owner NOT IN (?, ?)"
+  ).bind(url, ARCHIVE_OWNER, CATALOG_OWNER).all<ProductRow>();
+  return results;
 }
 
 async function updateProduct(request: Request, env: Env, id: number): Promise<Response> {
@@ -311,11 +435,22 @@ async function updateProduct(request: Request, env: Env, id: number): Promise<Re
   return json({ ok: true });
 }
 
-async function deleteProduct(env: Env, id: number): Promise<Response> {
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM prices WHERE product_id = ?").bind(id),
-    env.DB.prepare("DELETE FROM products WHERE id = ?").bind(id),
-  ]);
+// Removing a product never loses history: its price points move to another
+// row for the same url, or the row itself is kept as an archived one.
+async function deleteProduct(env: Env, p: ProductRow): Promise<Response> {
+  const keeper = await env.DB.prepare(
+    "SELECT id FROM products WHERE url = ? AND id != ? ORDER BY CASE owner WHEN ? THEN 1 ELSE 0 END, id LIMIT 1"
+  ).bind(p.url, p.id, ARCHIVE_OWNER).first<{ id: number }>();
+  if (keeper) {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE prices SET product_id = ? WHERE product_id = ?").bind(keeper.id, p.id),
+      env.DB.prepare("DELETE FROM products WHERE id = ?").bind(p.id),
+    ]);
+  } else {
+    await env.DB.prepare(
+      "UPDATE products SET owner = ?, target = NULL, bought_at = NULL, bought_price = NULL WHERE id = ?"
+    ).bind(ARCHIVE_OWNER, p.id).run();
+  }
   return json({ ok: true });
 }
 
@@ -329,11 +464,9 @@ async function checkNow(env: Env, p: ProductRow): Promise<Response> {
 }
 
 async function historyCsv(env: Env, p: ProductRow): Promise<Response> {
-  const { results } = await env.DB.prepare(
-    "SELECT price, checked_at FROM prices WHERE product_id = ? ORDER BY checked_at"
-  ).bind(p.id).all<{ price: number; checked_at: number }>();
-  const lines = ["date,price,currency"];
-  for (const r of results) lines.push(`${new Date(r.checked_at).toISOString()},${r.price},${p.currency || ""}`);
+  const rows = (await historyByUrl(env, "?", [p.url])).get(p.url) ?? [];
+  const lines = ["date,price,currency,source"];
+  for (const r of rows) lines.push(`${new Date(r.checked_at).toISOString()},${r.price},${p.currency || ""},${r.source || "check"}`);
   const name = p.title.replace(/[^\w.-]+/g, "_").slice(0, 60) || "history";
   return new Response(lines.join("\n") + "\n", {
     headers: {
@@ -352,7 +485,7 @@ async function historyCsv(env: Env, p: ProductRow): Promise<Response> {
 // Browse fill up on their own. Capped so the cron budget stays within limits.
 
 const CATALOG_OWNER = "catalog";
-const CATALOG_MAX = 400;
+const CATALOG_MAX = 1200; // discovery stops here; products people open still join
 const CATALOG_PER_RUN = 6;
 // Specific searches with a price floor: generic words ("camera") return
 // straps and lens caps, so each query names the kind of product and the least
@@ -375,6 +508,28 @@ const CATALOG_QUERIES: Array<{ q: string; min: number }> = [
   { q: "lg 27 inch monitor", min: 10000 }, { q: "nike running shoes men", min: 2500 }, { q: "adidas running shoes", min: 2500 },
   { q: "american tourister backpack", min: 1200 }, { q: "philips trimmer", min: 1000 }, { q: "mi power bank 20000mah", min: 1200 },
   { q: "kindle paperwhite", min: 10000 }, { q: "dyson airwrap", min: 30000 }, { q: "lego set", min: 1500 },
+  { q: "iphone 15", min: 40000 }, { q: "iphone 14", min: 35000 }, { q: "samsung galaxy s24", min: 35000 },
+  { q: "samsung galaxy z fold", min: 100000 }, { q: "samsung galaxy z flip", min: 60000 }, { q: "oneplus 12", min: 30000 },
+  { q: "poco phone", min: 8000 }, { q: "iqoo phone", min: 12000 }, { q: "infinix phone", min: 7000 },
+  { q: "lava phone", min: 5000 }, { q: "macbook pro m4", min: 150000 }, { q: "surface laptop", min: 60000 },
+  { q: "acer aspire laptop", min: 30000 }, { q: "msi gaming laptop", min: 60000 }, { q: "imac", min: 100000 },
+  { q: "mac mini", min: 50000 }, { q: "ipad pro", min: 80000 }, { q: "ipad air", min: 50000 },
+  { q: "garmin watch", min: 20000 }, { q: "fitbit", min: 8000 }, { q: "boat rockerz", min: 800 },
+  { q: "oneplus buds", min: 2000 }, { q: "samsung galaxy buds", min: 5000 }, { q: "sony earbuds", min: 5000 },
+  { q: "bose headphones", min: 15000 }, { q: "marshall speaker", min: 10000 }, { q: "sony soundbar", min: 15000 },
+  { q: "mi smart tv", min: 15000 }, { q: "oneplus tv", min: 15000 }, { q: "tcl tv", min: 15000 },
+  { q: "samsung refrigerator", min: 15000 }, { q: "whirlpool refrigerator", min: 12000 }, { q: "lg washing machine", min: 15000 },
+  { q: "bosch washing machine", min: 25000 }, { q: "ifb dishwasher", min: 30000 }, { q: "lg 1.5 ton split ac", min: 30000 },
+  { q: "voltas ac", min: 28000 }, { q: "havells air purifier", min: 6000 }, { q: "philips garment steamer", min: 2000 },
+  { q: "instant pot", min: 5000 }, { q: "bajaj ceiling fan", min: 1500 }, { q: "crompton water heater", min: 4000 },
+  { q: "nikon camera", min: 30000 }, { q: "dji drone", min: 30000 }, { q: "xbox series x", min: 35000 },
+  { q: "nintendo switch", min: 20000 }, { q: "samsung monitor", min: 8000 }, { q: "logitech mouse", min: 1000 },
+  { q: "mechanical keyboard", min: 2000 }, { q: "puma running shoes", min: 2000 }, { q: "skybags backpack", min: 1000 },
+  { q: "wildcraft backpack", min: 1000 }, { q: "titan watch men", min: 2000 }, { q: "fossil watch", min: 5000 },
+  { q: "ray-ban sunglasses", min: 4000 }, { q: "levis jeans men", min: 1000 }, { q: "allen solly shirt", min: 800 },
+  { q: "fastrack watch", min: 1000 }, { q: "atomberg fan", min: 2500 }, { q: "prestige induction cooktop", min: 1500 },
+  { q: "milton water bottle", min: 300 }, { q: "sleepwell mattress", min: 5000 }, { q: "wakefit mattress", min: 5000 },
+  { q: "samsung galaxy m35", min: 12000 }, { q: "redmi 14c", min: 7000 }, { q: "realme 14 pro", min: 18000 },
 ];
 
 async function setting(env: Env, key: string): Promise<string | null> {
@@ -436,8 +591,13 @@ async function discover(env: Env): Promise<void> {
 }
 
 async function catalog(env: Env): Promise<Response> {
-  const products = (await productsFor(env, CATALOG_OWNER)).map((p) => ({
-    ...p, owner: "", target: null, bought_at: null, bought_price: null,
+  // Newest 400 with their history; enough for Browse without a huge payload.
+  const { results: rows } = await env.DB.prepare(
+    "SELECT * FROM products WHERE owner = ? ORDER BY created_at DESC LIMIT 400"
+  ).bind(CATALOG_OWNER).all<ProductRow>();
+  const history = await historyByUrl(env, "SELECT url FROM products WHERE owner = ? ORDER BY created_at DESC LIMIT 400", [CATALOG_OWNER]);
+  const products = rows.map((p) => ({
+    ...withHistory(p, history.get(p.url)), owner: "", target: null, bought_at: null, bought_price: null,
   }));
   return json({ products }, 200, { "cache-control": "public, max-age=300" });
 }
@@ -454,7 +614,7 @@ async function deals(env: Env): Promise<Response> {
        SELECT p.url, p.title, p.image, p.store, p.currency, p.price, p.list_price, p.checked_at,
               (SELECT MAX(price) FROM prices WHERE product_id = p.id AND checked_at >= ?) AS was
        FROM products p
-       WHERE p.price IS NOT NULL AND p.error IS NULL AND p.checked_at >= ?
+       WHERE p.price IS NOT NULL AND p.error IS NULL AND p.checked_at >= ? AND p.owner != 'archive'
      )
      WHERE was IS NOT NULL AND was > price
      ORDER BY (was - price) * 1.0 / was DESC
@@ -527,13 +687,112 @@ function parseFlipkartSearch(html: string) {
   return out;
 }
 
+// ---------- past prices from the Wayback Machine ----------
+//
+// Stores don't publish old prices, but the Internet Archive has dated
+// snapshots of many product pages. Each snapshot is read with the same
+// parser, so the history can reach back years before anyone added the
+// product here. Runs once per url: on demand when a sheet opens, and from
+// the cron for everything else.
+
+const WAYBACK_MAX = 16; // snapshots fetched per product (subrequest budget)
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+async function backfillRoute(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as { url?: string };
+  let url: URL;
+  try { url = await canonicalUrl(new URL(String(body.url || ""))); } catch { return json({ error: "Give a product link" }, 400); }
+  const p = await env.DB.prepare("SELECT * FROM products WHERE url = ? ORDER BY backfilled_at DESC LIMIT 1")
+    .bind(url.href).first<ProductRow>();
+  if (!p) return json({ error: "That product isn't on the site yet" }, 404);
+  if (p.backfilled_at && Date.now() - p.backfilled_at < 3 * 60 * 1000) {
+    // Another request (the add, or the cron) is on it right now.
+    return json({ ok: true, added: 0, snapshots: 0, earliest: null, pending: true });
+  }
+  if (p.backfilled_at && Date.now() - p.backfilled_at < 30 * DAY_MS) {
+    return json({ ok: true, added: 0, snapshots: 0, earliest: null, cached: true });
+  }
+  return json(await backfill(env, p));
+}
+
+async function backfill(env: Env, p: ProductRow, max = WAYBACK_MAX): Promise<{ ok: boolean; added: number; snapshots: number; earliest: number | null }> {
+  const now = Date.now();
+  // Claim the url first so a concurrent request doesn't fetch the same snapshots.
+  await env.DB.prepare("UPDATE products SET backfilled_at = ? WHERE url = ?").bind(now, p.url).run();
+  let stamps: string[] = [];
+  try {
+    const cdx = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(p.url)}&output=json&fl=timestamp,statuscode&filter=statuscode:200&collapse=timestamp:6&limit=240`;
+    const res = await fetch(cdx, { headers: { "user-agent": UA } });
+    if (!res.ok) throw new Error(String(res.status));
+    const rows = (await res.json()) as string[][];
+    stamps = rows.slice(1).map((r) => r[0]).filter((t) => /^\d{14}$/.test(t));
+  } catch {
+    // The archive is down or rate-limiting; release the claim for another run.
+    await env.DB.prepare("UPDATE products SET backfilled_at = NULL WHERE url = ?").bind(p.url).run();
+    return { ok: false, added: 0, snapshots: 0, earliest: null };
+  }
+
+  // Spread the budget across the whole span rather than only the newest.
+  const pick: string[] = [];
+  if (stamps.length <= max) pick.push(...stamps);
+  else for (let i = 0; i < max; i++) pick.push(stamps[Math.round((i * (stamps.length - 1)) / (max - 1))]);
+
+  const existing = ((await historyByUrl(env, "?", [p.url])).get(p.url) ?? []).map((r) => r.checked_at);
+  let added = 0;
+  let earliest: number | null = null;
+  for (const ts of pick) {
+    const t = Date.UTC(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8), +ts.slice(8, 10), +ts.slice(10, 12), +ts.slice(12, 14));
+    if (existing.some((e) => Math.abs(e - t) < 1.5 * DAY_MS)) continue;
+    try {
+      // "id_" returns the page as captured, without the archive's toolbar.
+      const res = await fetch(`https://web.archive.org/web/${ts}id_/${p.url}`, { headers: { "user-agent": UA }, redirect: "follow" });
+      if (!res.ok) continue;
+      const info = await parsePage(res, p.url);
+      // Only confident readings go into history: structured data or the
+      // store's own price element, never a loose "price-ish" guess. A value
+      // wildly off today's price is a different variant or a broken capture.
+      if (info.price == null || (info.via || "").startsWith("guess")) continue;
+      if (p.price != null && (info.price > p.price * 4 || info.price < p.price / 4)) continue;
+      await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at, source) VALUES (?, ?, ?, 'wayback')")
+        .bind(p.id, info.price, t).run();
+      existing.push(t);
+      added++;
+      if (earliest == null || t < earliest) earliest = t;
+    } catch {
+      // A broken snapshot; move on.
+    }
+  }
+  await env.DB.prepare("UPDATE products SET backfilled_at = ? WHERE url = ?").bind(now, p.url).run();
+  return { ok: true, added, snapshots: stamps.length, earliest };
+}
+
+async function backfillDue(env: Env): Promise<void> {
+  // Two products per run, fewer snapshots each, to stay inside the fetch budget.
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM products WHERE backfilled_at IS NULL AND owner != ? GROUP BY url ORDER BY created_at LIMIT 2"
+  ).bind(ARCHIVE_OWNER).all<ProductRow>();
+  for (const p of results) await backfill(env, p, 10);
+}
+
 // ---------- scheduled checks ----------
 
 async function checkDue(env: Env): Promise<void> {
+  // Products someone has an alert on are checked every 6 hours; the public
+  // catalog once a day. Followed ones go first when the budget is tight.
+  const now = Date.now();
   const { results } = await env.DB.prepare(
-    "SELECT * FROM products WHERE checked_at IS NULL OR checked_at < ? ORDER BY checked_at LIMIT ?"
-  ).bind(Date.now() - CHECK_EVERY, BATCH).all<ProductRow>();
+    `SELECT * FROM (
+       SELECT p.*, EXISTS (SELECT 1 FROM products f WHERE f.url = p.url AND f.owner NOT IN (?, ?)) AS followed
+       FROM products p WHERE p.owner != ?
+     )
+     WHERE checked_at IS NULL OR checked_at < CASE WHEN followed THEN ? ELSE ? END
+     ORDER BY followed DESC, checked_at LIMIT ?`
+  ).bind(CATALOG_OWNER, ARCHIVE_OWNER, ARCHIVE_OWNER, now - CHECK_EVERY, now - 4 * CHECK_EVERY, BATCH).all<ProductRow>();
+  // One fetch per url; the result is written to every row that shares it.
+  const seen = new Set<string>();
   for (const p of results) {
+    if (seen.has(p.url)) continue;
+    seen.add(p.url);
     await checkProduct(env, p);
   }
 }
@@ -553,22 +812,25 @@ async function checkProduct(env: Env, p: ProductRow): Promise<{ price?: number; 
     if (BLOCKED_STORES.test(new URL(p.url).hostname)) {
       error = `${p.store} blocks automatic checks. Open the product page and click the "Track price" bookmark to record today's price.`;
     }
-    await env.DB.prepare("UPDATE products SET error = ?, checked_at = ? WHERE id = ?")
-      .bind(error, now, p.id).run();
+    await env.DB.prepare("UPDATE products SET error = ?, checked_at = ? WHERE url = ?")
+      .bind(error, now, p.url).run();
     return { error };
   }
 
+  // Everyone following this url is alerted from their own target; read them
+  // before the shared update overwrites the old price.
+  const followers = await followersOf(env, p.url);
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE products SET price = ?, currency = COALESCE(?, currency), error = NULL, availability = ?,
        list_price = COALESCE(?, list_price), render = MAX(render, ?), checked_at = ?, image = COALESCE(image, ?)
-       WHERE id = ?`
-    ).bind(info.price, info.currency, info.availability, info.listPrice, info.rendered ? 1 : 0, now, info.image, p.id),
+       WHERE url = ?`
+    ).bind(info.price, info.currency, info.availability, info.listPrice, info.rendered ? 1 : 0, now, info.image, p.url),
     env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
       .bind(p.id, info.price, now),
   ]);
 
-  await alertIfNeeded(env, p, info);
+  for (const f of followers) await alertIfNeeded(env, f, info);
   return { price: info.price };
 }
 

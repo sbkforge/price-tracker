@@ -7,8 +7,8 @@ import {
 } from "lucide";
 import type { IconNode } from "lucide";
 import type {
-  CheckResponse, CompareHit, CompareResponse, ConfigResponse, Deal, DealsResponse, ListResponse,
-  PricePoint, Product, ShareResponse, Snapshot, UpdateRequest,
+  BackfillResponse, CheckResponse, CompareHit, CompareResponse, ConfigResponse, Deal, DealsResponse, ListResponse,
+  OpenResponse, PricePoint, Product, ShareResponse, Snapshot, UpdateRequest,
 } from "../src/shared";
 
 // ---------- icons (Lucide) ----------
@@ -372,15 +372,15 @@ function render(): void {
   $("heading").textContent = shared ? "Shared list" : "Prices";
   $("subtitle").textContent = all.length
     ? `${all.length} product${all.length === 1 ? "" : "s"} · ${all.filter(isDropped).length} dropped · ${all.filter(isHit).length} below target${shared ? "" : ` · ${all.filter((p) => p.bought_at).length} bought`}`
-    : shared ? "This list is empty." : "Paste a product link to start watching its price, or type a product name to search.";
+    : shared ? "This list is empty." : "Products you've set alerts on. Paste any product link to see its full price history, or type a name to search.";
 
   const noneAtAll = all.length === 0;
   $("skeleton").hidden = state.loaded || shared;
   setEmpty(state.loaded && shown.length === 0,
     noneAtAll ? "No products yet" : "Nothing here",
     noneAtAll
-      ? "Add a link from any online store, or search a product by name. We'll check prices every 6 hours."
-      : "No tracked product matches this filter.",
+      ? "Set an alert on any product (Browse, search, or paste a link) and it shows up here. Every product's history is public either way."
+      : "No product on your list matches this filter.",
     noneAtAll && !shared);
   $("products").replaceChildren(...shown.map((p) => card(p, shared)));
 }
@@ -407,7 +407,7 @@ function renderSearch(): void {
   const s = state.search;
   $("skeleton").hidden = !s.loading;
   $("heading").textContent = "Search";
-  $("subtitle").textContent = "Pick a result to track it, or paste a link from any store.";
+  $("subtitle").textContent = "Tap a result to see its full price history, or paste a link from any store.";
   $("searchTitle").textContent = s.loading ? `Searching for “${s.query}”…` : `Results for “${s.query}”`;
   $("searchLinks").replaceChildren(...storeLinks(s.query));
   setEmpty(!s.loading && s.hits.length === 0, "No results",
@@ -426,17 +426,16 @@ function storeLinks(q: string): HTMLAnchorElement[] {
 }
 
 function hitCard(h: CompareHit): HTMLElement {
-  const c = el("article", "card result");
+  const c = el("article", "card result clickable");
   c.append(cardTop(h.image, h.title, h.url, h.store));
   const row = el("div", "price-row");
   row.append(el("span", "price", money(h.price, h.currency || "INR")));
   const foot = el("div", "card-foot");
-  const mine = state.products.find((p) => p.url === h.url);
-  const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track this");
-  track.disabled = !!mine;
-  track.addEventListener("click", () => trackUrl(h.url, track));
-  foot.append(el("span", "spacer"), track);
+  const open = pill("history", "Price history");
+  open.addEventListener("click", (e) => { e.stopPropagation(); void openProduct(h.url); });
+  foot.append(el("span", "spacer"), open);
   c.append(row, foot);
+  c.addEventListener("click", (e) => { if (!(e.target as HTMLElement).closest("a")) void openProduct(h.url); });
   return c;
 }
 
@@ -483,7 +482,7 @@ function categoryChips(titles: string[]): void {
 
 async function renderBrowse(): Promise<void> {
   $("heading").textContent = "Browse";
-  $("subtitle").textContent = "Popular products tracked automatically, with history and a deal score before you add anything. Tap Track this to put one on your list.";
+  $("subtitle").textContent = "Every product on the site, with its full price history and deal score. Set an alert on any of them and it joins your list.";
   $("skeleton").hidden = !!state.catalog;
   if (!state.catalog) {
     $("products").replaceChildren();
@@ -583,27 +582,30 @@ function dealCard(d: Deal): HTMLElement {
 
   const foot = el("div", "card-foot");
   const stamp = el("span", "muted", `Dropped ${ago(d.checked_at)}`);
-  const mine = state.products.some((p) => p.url === d.url);
-  const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track this");
-  track.disabled = mine;
-  track.addEventListener("click", () => trackUrl(d.url, track));
-  foot.append(stamp, el("span", "spacer"), track);
+  const open = pill("history", "Price history");
+  open.addEventListener("click", (e) => { e.stopPropagation(); void openProduct(d.url); });
+  foot.append(stamp, el("span", "spacer"), open);
   c.append(row, foot);
+  c.classList.add("clickable");
+  c.addEventListener("click", (e) => { if (!(e.target as HTMLElement).closest("a")) void openProduct(d.url); });
   return c;
 }
 
-async function trackUrl(url: string, button: HTMLButtonElement): Promise<void> {
-  button.disabled = true;
-  button.replaceChildren(icon("refresh-cw", 14), " Adding…");
+// Any product link, from anywhere: open its site-wide history. New links join
+// the public catalog on the server; nothing goes on the person's list.
+let opening = false;
+async function openProduct(url: string): Promise<void> {
+  if (opening) return;
+  opening = true;
+  toast("Opening the product…", "info");
   try {
-    await api("/api/products", { method: "POST", body: JSON.stringify({ url }) });
-    toast("Added to your list", "success");
-    button.replaceChildren(icon("check", 14), " Tracking");
-    await load();
+    const r = await api<OpenResponse>("/api/open", { method: "POST", body: JSON.stringify({ url }) });
+    openHistory(r.product, true, r.pending);
+    $("toast").classList.remove("show");
   } catch (err) {
     toast((err as Error).message, "error");
-    button.disabled = false;
-    button.replaceChildren(icon("plus", 14), " Track this");
+  } finally {
+    opening = false;
   }
 }
 
@@ -652,11 +654,13 @@ function card(p: Product, readOnly = false): HTMLElement {
     s.append(el("span", "k", label), el("span", "v", value));
     return s;
   };
+  const spansDays = p.history.length > 1 && p.history[p.history.length - 1][0] - p.history[0][0] > DAY;
   stats.append(
     stat("Low", money(p.lowest, p.currency)),
     stat("High", money(p.highest, p.currency)),
     stat("Avg", money(tidy(p, p.average), p.currency)),
-    stat("Checked", ago(p.checked_at))
+    spansDays ? stat("Since", dateShort(p.history[0][0]) + (new Date(p.history[0][0]).getFullYear() !== new Date().getFullYear() ? ` ${new Date(p.history[0][0]).getFullYear()}` : ""))
+      : stat("Checked", ago(p.checked_at))
   );
 
   c.append(row, chart(p, 72), stats);
@@ -664,13 +668,25 @@ function card(p: Product, readOnly = false): HTMLElement {
 
   const foot = el("div", "card-foot");
   if (readOnly) {
+    // Browse and shared lists: set an alert straight away; that follows the
+    // product for you. No "track" step first.
+    const mineRow = state.products.find((x) => x.url === p.url);
+    const label = el("label", "target");
+    label.append(el("span", undefined, "Alert below"));
+    const target = el("input");
+    target.type = "number";
+    target.min = "0";
+    target.step = "any";
+    target.inputMode = "decimal";
+    target.placeholder = mineRow ? "any" : "price";
+    target.value = mineRow?.target == null ? "" : String(mineRow.target);
+    target.addEventListener("change", () => alertFromBrowse(p, target.value));
+    label.append(target);
+
     const history = pill("history", "History");
     history.addEventListener("click", () => openHistory(p, true));
-    const mine = state.products.some((x) => x.url === p.url);
-    const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track this");
-    track.disabled = mine;
-    track.addEventListener("click", () => trackUrl(p.url, track));
-    foot.append(history, el("span", "spacer"), track);
+    foot.append(label, history);
+    if (mineRow) foot.append(el("span", "chip bought", "On my list"));
     c.append(foot);
     // Catalog and shared products are read-only here, but their history is real.
     c.classList.add("readonly");
@@ -712,6 +728,34 @@ const svgEl = (tag: string, attrs: Record<string, string | number>): SVGElement 
   return e;
 };
 
+// A smooth curve through the points. Monotone cubic tangents (Fritsch–Carlson)
+// keep it from overshooting, so the curve never shows a price the data
+// doesn't contain between two real points.
+function smoothPath(pts: Array<[number, number]>): string {
+  const n = pts.length;
+  if (n < 2) return n ? `M ${pts[0][0]} ${pts[0][1]}` : "";
+  const dx: number[] = [], dy: number[] = [], m: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    dx.push(pts[i + 1][0] - pts[i][0] || 1e-6);
+    dy.push(pts[i + 1][1] - pts[i][1]);
+    m.push(dy[i] / dx[i]);
+  }
+  const t: number[] = [m[0]];
+  for (let i = 1; i < n - 1; i++) t.push(m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2);
+  t.push(m[n - 2]);
+  for (let i = 0; i < n - 1; i++) {
+    if (m[i] === 0) { t[i] = 0; t[i + 1] = 0; continue; }
+    const a = t[i] / m[i], b = t[i + 1] / m[i], s = a * a + b * b;
+    if (s > 9) { const k = 3 / Math.sqrt(s); t[i] = k * a * m[i]; t[i + 1] = k * b * m[i]; }
+  }
+  let d = `M ${pts[0][0].toFixed(1)} ${pts[0][1].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = dx[i] / 3;
+    d += ` C ${(pts[i][0] + h).toFixed(1)} ${(pts[i][1] + t[i] * h).toFixed(1)}, ${(pts[i + 1][0] - h).toFixed(1)} ${(pts[i + 1][1] - t[i + 1] * h).toFixed(1)}, ${pts[i + 1][0].toFixed(1)} ${pts[i + 1][1].toFixed(1)}`;
+  }
+  return d;
+}
+
 function chart(p: Product, height: number): SVGElement {
   const W = 300, H = height, PAD = 4;
   const svg = svgEl("svg", { class: "chart", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", role: "img" });
@@ -734,8 +778,7 @@ function chart(p: Product, height: number): SVGElement {
   const x = (t: number) => PAD + ((t - t0) / span) * (W - PAD * 2);
   const y = (v: number) => PAD + (1 - (v - lo) / (hi - lo)) * (H - PAD * 2);
 
-  const pts = h.map(([t, v]) => `${x(t).toFixed(1)} ${y(v).toFixed(1)}`);
-  const d = `M ${pts.join(" L ")}`;
+  const d = smoothPath(h.map(([t, v]) => [x(t), y(v)]));
   const gid = `g${p.id}-${H}`;
 
   const defs = svgEl("defs", {});
@@ -805,10 +848,11 @@ function timeline(p: Product, h: PricePoint[]): SVGElement {
   svg.style.height = `${H}px`;
   svg.setAttribute("aria-label", `Price timeline, ${h.length} checks`);
   const readout = $("hReadout");
+  readout.textContent = "";
   if (h.length < 2) {
     svg.classList.add("flat");
     svg.append(svgEl("line", { class: "line", x1: 0, x2: W, y1: H / 2, y2: H / 2 }));
-    readout.textContent = h.length ? "Only one check so far; the line grows with each check." : "No checks in this range.";
+    readout.textContent = h.length ? "Only one price so far; the line grows with each check." : "No prices in this range.";
     return svg;
   }
 
@@ -845,8 +889,7 @@ function timeline(p: Product, h: PricePoint[]): SVGElement {
   }
 
   // Line and area
-  const pts = h.map(([t, v]) => `${x(t).toFixed(1)} ${y(v).toFixed(1)}`);
-  const d = `M ${pts.join(" L ")}`;
+  const d = smoothPath(h.map(([t, v]) => [x(t), y(v)]));
   const gid = `tl${p.id}`;
   const defs = svgEl("defs", {});
   const grad = svgEl("linearGradient", { id: gid, x1: 0, x2: 0, y1: 0, y2: 1 });
@@ -923,7 +966,7 @@ function renderHistoryChart(): void {
     const since = dateLong(p.history[0][0]);
     lowLine.append(
       "Lowest ", el("b", "lo", money(low[1], p.currency)), ` on ${dateLong(low[0])}`,
-      el("span", "muted", ` · tracking since ${since}`)
+      el("span", "muted", ` · history since ${since}`)
     );
   }
 }
@@ -973,11 +1016,9 @@ function hitRow(h: { title: string; url: string; store: string; image: string | 
   const right = el("div", "hit-right");
   const cheaper = h.price != null && compareTo != null && h.price < compareTo;
   right.append(el("span", `p ${cheaper ? "cheaper" : ""}`, money(h.price, h.currency || "INR")));
-  const mine = state.products.some((x) => x.url === h.url);
-  const track = pill(mine ? "check" : "plus", mine ? "Tracking" : "Track");
-  track.disabled = mine;
-  track.addEventListener("click", () => trackUrl(h.url, track));
-  right.append(track);
+  const open = pill("history", "History");
+  open.addEventListener("click", () => void openProduct(h.url));
+  right.append(open);
   row.append(img, mid, right);
   return row;
 }
@@ -1020,10 +1061,77 @@ async function loadCategoryDeals(p: Product): Promise<void> {
   box.hidden = false;
 }
 
-function openHistory(p: Product, readOnly = false): void {
+function openHistory(p: Product, readOnly = false, pending = false): void {
+  fillHistory(p, readOnly);
+  $<HTMLDialogElement>("historySheet").showModal();
+  $<HTMLDialogElement>("historySheet").scrollTop = 0;
+  void loadRelated(p);
+  void loadCategoryDeals(p);
+  void loadArchive(p, readOnly, pending);
+}
+
+// Re-read the product (site-wide history plus the person's own alert) and redraw.
+async function refreshSheet(p: Product, readOnly: boolean): Promise<Product | null> {
+  try {
+    const r = await api<OpenResponse>("/api/open", { method: "POST", body: JSON.stringify({ url: p.url }) });
+    if (sheetProduct !== p) return null;
+    sheetProduct = r.product;
+    fillHistory(r.product, readOnly);
+    return r.product;
+  } catch {
+    return null;
+  }
+}
+
+// Older prices from the Wayback Machine: already there, running in the
+// background (a product just opened or added), or fetched now.
+async function loadArchive(p: Product, readOnly: boolean, pending = false): Promise<void> {
+  const note = $("hArchive");
+  const describe = (q: Product) => {
+    note.hidden = false;
+    note.textContent = q.archived
+      ? `${q.archived} of these prices come from Internet Archive snapshots of the product page; history since ${dateLong(q.history[0][0])}.`
+      : "No readable past prices in the Internet Archive for this page; history grows with every check from here on.";
+  };
+  if (p.backfilled_at && !pending) return describe(p);
+
+  note.hidden = false;
+  note.textContent = "Looking for older prices in the Internet Archive…";
+  try {
+    if (!pending) {
+      const r = await api<BackfillResponse & { cached?: boolean; pending?: boolean }>("/api/backfill", { method: "POST", body: JSON.stringify({ url: p.url }) });
+      if (sheetProduct !== p) return;
+      if (!r.ok) { note.textContent = "The Internet Archive didn't answer; older prices will be added later."; return; }
+      pending = !!r.pending;
+    }
+    // Give a background lookup time to land, then redraw with what it found.
+    if (pending) await new Promise((res) => setTimeout(res, 15000));
+    if (sheetProduct !== p) return;
+    const fresh = await refreshSheet(p, readOnly);
+    if (fresh) {
+      describe(fresh);
+      if (!readOnly) await load();
+    }
+  } catch (err) {
+    note.textContent = `Couldn't look up older prices: ${(err as Error).message}`;
+  }
+}
+
+function fillHistory(p: Product, readOnly: boolean): void {
   sheetProduct = p;
   $("hTitle").textContent = p.title;
-  $("hMeta").textContent = `${p.store} · ${p.history.length} check${p.history.length === 1 ? "" : "s"} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(tidy(p, p.average), p.currency)}`;
+  const since = p.history.length ? ` · since ${dateLong(p.history[0][0])}` : "";
+  $("hMeta").textContent = `${p.store} · ${p.history.length} price point${p.history.length === 1 ? "" : "s"}${since} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(tidy(p, p.average), p.currency)}`;
+
+  // Alert straight from the sheet: this is how a product gets on "Mine".
+  const mineRow = state.products.find((x) => x.url === p.url);
+  const target = $<HTMLInputElement>("hTarget");
+  const current = mineRow?.target ?? p.target ?? null;
+  target.value = current == null ? "" : String(current);
+  target.onchange = () => alertFromBrowse(p, target.value);
+  $("hAlertNote").textContent = current != null
+    ? `You'll be alerted at or below ${money(current, p.currency)}.`
+    : mineRow ? "On your list; you'll be told about any drop." : "Set a price and this product joins your list.";
 
   // Deal score
   const ds = dealScore(p);
@@ -1080,11 +1188,6 @@ function openHistory(p: Product, readOnly = false): void {
       prev && diff !== 0 ? `${diff < 0 ? "▼" : "▲"} ${money(Math.abs(diff), p.currency)}` : "–"));
     tbody.append(tr);
   });
-
-  $<HTMLDialogElement>("historySheet").showModal();
-  $<HTMLDialogElement>("historySheet").scrollTop = 0;
-  void loadRelated(p);
-  void loadCategoryDeals(p);
 }
 
 // CSV download needs the owner header, which a plain link can't send.
@@ -1116,39 +1219,64 @@ $<HTMLFormElement>("add").addEventListener("submit", async (e) => {
   const value = input.value.trim();
   if (!value) return;
 
-  // A product name rather than a link: search instead of tracking.
+  // A product name rather than a link: search.
   if (!isUrl(value)) {
     void runSearch(value);
     return;
   }
 
+  // A link: open its history. With a price in the alert box, also set the alert.
   button.disabled = true;
   button.textContent = "Reading…";
   try {
-    await api("/api/products", {
-      method: "POST",
-      body: JSON.stringify({ url: value, target: target.value || null }),
-    });
+    const r = await api<OpenResponse>("/api/open", { method: "POST", body: JSON.stringify({ url: value }) });
+    if (target.value) {
+      await api("/api/products", { method: "POST", body: JSON.stringify({ url: r.product.url, target: Number(target.value) }) })
+        .catch(async (err: Error) => {
+          if (!/already/.test(err.message)) throw err;
+          const mine = (await api<ListResponse>("/api/products")).products.find((x) => x.url === r.product.url);
+          if (mine) await update(mine, { target: Number(target.value) });
+        });
+      await load();
+      r.product.target = Number(target.value);
+    }
     input.value = "";
     target.value = "";
-    if (state.mode === "search") state.mode = "list";
-    toast("Added. We'll watch this price for you.", "success");
-    await load();
+    openHistory(r.product, true, r.pending);
   } catch (err) {
     toast((err as Error).message, "error");
   } finally {
     button.disabled = false;
-    button.textContent = "Track";
+    button.textContent = "Open";
   }
 });
 
 $<HTMLInputElement>("url").addEventListener("input", (e) => {
   const v = (e.target as HTMLInputElement).value.trim();
-  $("track").textContent = v && !isUrl(v) ? "Search" : "Track";
+  $("track").textContent = v && !isUrl(v) ? "Search" : "Open";
 });
 
 async function update(p: Product, body: UpdateRequest): Promise<void> {
   await api(`/api/products/${p.id}`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+// Setting an alert on a Browse or shared card follows the product for you.
+async function alertFromBrowse(p: Product, value: string): Promise<void> {
+  const target = value === "" ? null : Number(value);
+  const mineRow = state.products.find((x) => x.url === p.url);
+  try {
+    if (mineRow) {
+      await update(mineRow, { target });
+    } else {
+      if (target == null) return;
+      await api("/api/products", { method: "POST", body: JSON.stringify({ url: p.url, target }) });
+    }
+    toast(target == null ? "Alert removed" : `Alert set at ${money(target, p.currency)}. It's on your list now.`, "success");
+    await load();
+    render();
+  } catch (err) {
+    toast((err as Error).message, "error");
+  }
 }
 
 async function setTarget(p: Product, value: string): Promise<void> {
@@ -1282,8 +1410,7 @@ async function handleQuery(): Promise<void> {
   const link = /https?:\/\/\S+/.exec(text || "")?.[0];
   if (!link) return;
   history.replaceState(null, "", "/");
-  $<HTMLInputElement>("url").value = link;
-  $<HTMLFormElement>("add").requestSubmit();
+  void openProduct(link);
 }
 
 // ---------- sheets ----------

@@ -121,7 +121,7 @@ for (const p of PRODUCTS) {
       ok("Bookmark on the same page records a new price", again.status === 200 && again.data.updated === true && again.data.price === 129900, JSON.stringify(again.data));
       const { data } = await api("/api/products");
       const p = data.products.find((x) => x.id === snap.data.id);
-      ok("Snapshot product has two history points and the list price", p && p.history.length === 2 && p.price === 129900 && p.list_price === 139900 && p.highest === 134900);
+      ok("Snapshot product has both points and the list price", p && p.history.length >= 2 && p.price === 129900 && p.list_price === 139900 && p.highest >= 134900, p ? `${p.history.length} points, high ${p.highest}` : "missing");
     }
   }
 }
@@ -136,7 +136,10 @@ let products = [];
     const p = products.find((x) => x.id === a.id);
     if (!ok(`${a.name}: present`, !!p)) continue;
     ok(`${a.name}: title, store, price, currency`, p.title.length > 3 && p.store && p.price > 0 && p.currency, `${p.store} · ${p.title.slice(0, 50)}`);
-    if (!a.snapshot) ok(`${a.name}: history has the first point (chart data)`, Array.isArray(p.history) && p.history.length >= 1 && p.history[0][1] === p.price && p.lowest === p.price && p.highest === p.price && p.first === p.price);
+    // History is site-wide, so a product someone tracked before arrives with its past.
+    const hasHistory = Array.isArray(p.history) && p.history.length >= 1;
+    ok(`${a.name}: history present and consistent (chart data)`, hasHistory && p.lowest <= p.price && p.price <= p.highest && p.history.every(([t, v]) => t > 0 && v > 0),
+      hasHistory ? `${p.history.length} points since ${new Date(p.history[0][0]).toISOString().slice(0, 10)}` : "NO HISTORY ROWS");
     ok(`${a.name}: photo found`, !!p.image, p.image ? "" : "no image");
     if (p.availability == null) skipped(`${a.name}: stock status`, "the page doesn't say");
     else ok(`${a.name}: stock status read`, ["in_stock", "out_of_stock", "preorder"].includes(p.availability), String(p.availability));
@@ -162,14 +165,68 @@ if (added.length) {
   p = data.products.find((x) => x.id === a.id);
   ok("Clear purchase", p.bought_at === null && p.bought_price === null);
   const c = await api(`/api/products/${a.id}/check`, { method: "POST" });
-  ok("Check now (fresh result reused)", c.status === 200 && c.data.ok && c.data.cached === true, JSON.stringify(c.data));
+  ok("Check now", c.status === 200 && c.data.ok && c.data.price > 0, JSON.stringify(c.data));
   const csv = await api(`/api/products/${a.id}/history.csv`, { raw: true });
   const text = await csv.text();
-  ok("CSV export", csv.status === 200 && text.startsWith("date,price,currency") && text.trim().split("\n").length === 2, text.trim().split("\n")[1]);
+  ok("CSV export", csv.status === 200 && text.startsWith("date,price,currency,source") && text.trim().split("\n").length >= 2, text.trim().split("\n")[1]);
   const foreign = await api(`/api/products/${a.id}`, { as: other, method: "DELETE" });
   ok("Another visitor can't delete it", foreign.status === 404);
   const foreignList = await api("/api/products", { as: other });
   ok("Another visitor sees an empty list", foreignList.data.products.length === 0);
+  // The same product for someone else: instant, no fetch, same history.
+  const t0 = Date.now();
+  const twin = await api("/api/products", { as: other, method: "POST", body: { url: a.url, target: 5 } });
+  ok("Another visitor adds it instantly with the shared history", twin.status === 201 && twin.data.via === "shared" && Date.now() - t0 < 3000, `${twin.data.via} in ${Date.now() - t0}ms`);
+  const twinList = await api("/api/products", { as: other });
+  const mine = (await api("/api/products")).data.products.find((x) => x.id === a.id);
+  const theirs = twinList.data.products[0];
+  ok("Both see identical history, separate targets", theirs && theirs.history.length === mine.history.length && theirs.target === 5 && mine.target === 999);
+  await api(`/api/products/${theirs.id}`, { as: other, method: "DELETE" });
+  const afterDel = (await api("/api/products")).data.products.find((x) => x.id === a.id);
+  ok("Their removal doesn't touch the shared history", afterDel && afterDel.history.length === mine.history.length);
+}
+
+section("Open any link: public history, no tracking step");
+{
+  const viewer = "e2eviewer" + Math.random().toString(36).slice(2).padEnd(18, "v");
+  const boat = added.find((a) => /boAt/.test(a.name));
+  if (boat) {
+    const t0 = Date.now();
+    const o = await api("/api/open", { as: viewer, method: "POST", body: { url: boat.url } });
+    ok("A visitor opens a known product instantly", o.status === 200 && o.data.product && o.data.product.price > 0 && Date.now() - t0 < 3000, `${Date.now() - t0}ms, ${o.data.product?.history.length} points`);
+    ok("They see the same history, with no row of their own", o.data.product.history.length >= 1 && o.data.mineId === null && o.data.product.target === null);
+    const list = await api("/api/products", { as: viewer });
+    ok("Opening adds nothing to their list", list.data.products.length === 0);
+    const alert = await api("/api/products", { as: viewer, method: "POST", body: { url: boat.url, target: 500 } });
+    const again = await api("/api/open", { as: viewer, method: "POST", body: { url: boat.url } });
+    ok("Setting an alert puts it on their list, and the sheet shows it", alert.status === 201 && again.data.mineId === alert.data.id && again.data.product.target === 500);
+    await api(`/api/products/${alert.data.id}`, { as: viewer, method: "DELETE" });
+  }
+  const fresh = await api("/api/open", { as: viewer, method: "POST", body: { url: "https://www.apple.com/in/shop/buy-iphone/iphone-16" } });
+  ok("A link not yet on the site joins the public catalog", fresh.status === 200 && fresh.data.product?.price > 0 && fresh.data.product.history.length >= 1, `${fresh.data.product?.price} ${fresh.data.product?.currency}, ${fresh.data.product?.history.length} points, archive pending: ${fresh.data.pending}`);
+  const bad = await api("/api/open", { as: viewer, method: "POST", body: { url: "not a link" } });
+  ok("A non-link is refused", bad.status === 400);
+}
+
+section("Older prices from the Internet Archive");
+{
+  const boat = added.find((a) => /boAt/.test(a.name));
+  if (boat) {
+    const t0 = Date.now();
+    const r = await api("/api/backfill", { method: "POST", body: { url: boat.url } });
+    const secs = ((Date.now() - t0) / 1000).toFixed(0);
+    if (r.status === 200 && r.data.ok === false) skipped("Backfill from the Wayback Machine", "archive didn't answer");
+    else if (r.status === 200 && r.data.cached) skipped("Backfill from the Wayback Machine", "already done for this page recently");
+    else {
+      ok("Backfill from the Wayback Machine", r.status === 200 && r.data.ok && r.data.snapshots > 0, `${r.data.snapshots} snapshots, ${r.data.added} prices added in ${secs}s`);
+      const { data } = await api("/api/products");
+      const p = data.products.find((x) => x.id === boat.id);
+      ok("History now reaches back years", p && p.backfilled_at > 0 && p.history.length >= 2 && p.history[0][0] < Date.now() - 365 * 86400000, p ? `${p.history.length} points, ${p.archived} from the archive, since ${new Date(p.history[0][0]).toISOString().slice(0, 10)}` : "missing");
+      const csv = await api(`/api/products/${boat.id}/history.csv`, { raw: true });
+      const text = await csv.text();
+      ok("CSV includes archive rows", csv.status === 200 && /wayback/.test(text), `${text.trim().split("\n").length - 1} rows`);
+    }
+  } else skipped("Backfill from the Wayback Machine", "boAt product wasn't added");
 }
 
 section("Share, search, deals");

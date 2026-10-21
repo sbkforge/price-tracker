@@ -1,13 +1,14 @@
 # Price Tracker
 
-Track product prices from online stores, see the history, and get a push alert when a price drops. Paste a product link, optionally set a target price, and it checks the price every 6 hours.
+Paste any product link, or tap any product on the site, and see its full price history: every check this site has ever made for that page, plus dated prices read from the Internet Archive's Wayback Machine snapshots of the page, often going back years. Set an alert and you get a push when the price drops. No accounts, no "track" step: history is public and shared.
 
 Written in TypeScript and runs entirely on Cloudflare's free plan: a Worker, a D1 database, a cron trigger, Browser Rendering for JavaScript-heavy stores, and Web Push with no third-party service. No accounts, no credit card.
 
 ## Features
 
-- Add any product link; it reads the name, price, currency, photo and stock status from the page
-- Price checked every 6 hours, with full history, a chart, and low / high / average
+- Open any product link; it reads the name, price, currency, photo and stock status from the page and joins the public catalog
+- **History from before you arrived**: all prices anyone's check produced for that page, plus Wayback Machine snapshots parsed with the same reader (only structured data or the store's own price element counts; loose guesses and values 4× off the current price are rejected). Archive lookup runs in the background when a product first appears and from the cron for the rest
+- Checked every 6 hours when someone has an alert on it, daily otherwise; smooth monotone-cubic charts that never overshoot the data; 1W/1M/3M/1Y/All ranges
 - **Push alerts** when a price drops (any drop, or at or below your target) and when an item is back in stock
 - **Buy or Wait verdict** per product, judged from its own history (lowest, average), plus "% off MRP" with an inflated-MRP warning
 - **Deals feed**: biggest drops in the last 7 days across everything people track (product facts only, never who tracks what)
@@ -66,7 +67,9 @@ Every request sends an `x-owner` header: a random 16–64 character id the page 
 | `GET /https://<store>/...` | Redirects to the app with that product ready to track |
 | `GET /api/compare?q=` | Search other stores for a product name |
 | `GET /api/inspect?url=` | What the reader sees on a page (for "why can't this be tracked?") |
-| `GET /api/products` | All products with price history |
+| `POST /api/open` | `{ "url" }`: open any product link (joins the public catalog if new) and get its site-wide history |
+| `POST /api/backfill` | `{ "url" }`: pull past prices from the Wayback Machine (once per page) |
+| `GET /api/products` | Your list (alerts) with the shared history |
 | `GET /api/products/<id>/history.csv` | Price history as CSV |
 | `POST /api/push` / `DELETE /api/push` | Turn push alerts on or off for this browser |
 | `POST /api/push/test` | Send a test alert |

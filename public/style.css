@@ -460,3 +460,12 @@ button.primary.small { height: 40px; padding: 0 16px; font-size: 15px; border-ra
 }
 @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 @media (prefers-reduced-motion: reduce) { .card.skeleton::before { animation: none; } }
+
+/* ---------- public history: open-by-click, alert in the sheet ---------- */
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { box-shadow: var(--shadow), 0 0 0 1.5px color-mix(in srgb, var(--blue) 45%, transparent); }
+.sheet-alert { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 12px; padding: 10px 12px; border-radius: 12px; background: var(--surface-2); }
+.sheet-alert .target { flex: 0 1 auto; color: var(--text); }
+.sheet-alert .target .ic { color: var(--blue); }
+.sheet-alert .target input { width: 110px; background: var(--surface); }
+.sheet-alert .muted { margin: 0; font-size: 13px; }

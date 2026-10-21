@@ -39,6 +39,12 @@ Three parts share one types file:
 - `src/shared.ts`: row and API types used by both. Change the DB schema here, in a new migration, and in the SQL that reads/writes it.
 - `src/push.ts`: Web Push without a third party: VAPID JWT (ES256) and RFC 8291 `aes128gcm` encryption via WebCrypto. Workers' type for ECDH params spells the field `$public`, hence the cast.
 
+### History is site-wide
+
+`prices` rows belong to a product row, but history is read **by url** across every row (`historyByUrl`): all owners, the `catalog` owner, and `archive` rows (what's left when the last follower removes a product; `deleteProduct` re-parents points or converts the row). `checkDue` fetches once per url and `UPDATE ... WHERE url = ?`, then alerts each follower from their own target. Adding a url the site already knows clones the row instantly (`via: "shared"`), no fetch. `POST /api/open` is the public entry: new links join the catalog owner; nothing goes on the visitor's list until they set an alert (`POST /api/products` with `target`).
+
+`backfill()` pulls dated prices from the Wayback Machine (CDX list → up to N `id_` snapshots spread over the span → `parsePage` with the original url so marketplace rules apply). Guards: claim `backfilled_at` first so concurrent calls skip, reject `guess:` readings and prices 4× off the current one, and never insert twins within 1.5 days. Runs via `ctx.waitUntil` on open/add, on demand from the sheet, and 2 per cron. `prices.source` marks `wayback`/`bookmark`.
+
 ### Identity: owner ids, not accounts
 
 Every browser generates a random id (`localStorage.owner`) and sends it as the `x-owner` header. All product routes are scoped by it; it doubles as the "sync code" users paste on another device. `/api/config`, `/api/deals` and static files are the only owner-less routes. Max 30 products per owner.

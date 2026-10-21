@@ -39,13 +39,13 @@
 
     <section class="hero">
       <h1 id="heading">Prices</h1>
-      <p id="subtitle" class="subtitle">Paste a product link to start watching its price, or type a product name to search.</p>
+      <p id="subtitle" class="subtitle">Paste any product link to see its full price history, or type a name to search.</p>
     </section>
 
     <form id="add" class="add">
       <div class="field grow">
         <i class="ic field-ic" data-icon="search"></i>
-        <input id="url" type="text" placeholder="Paste a product link or search a product" autocomplete="off" autocapitalize="off" required>
+        <input id="url" type="text" placeholder="Paste a product link or search by name" autocomplete="off" autocapitalize="off" required>
         <button id="voice" type="button" class="mic" title="Search by voice" aria-label="Search by voice">
           <i class="ic" data-icon="mic"></i>
         </button>
@@ -54,7 +54,7 @@
         <i class="ic field-ic" data-icon="bell-ring"></i>
         <input id="target" type="number" min="0" step="any" placeholder="Alert below" inputmode="decimal">
       </div>
-      <button id="track" class="primary" type="submit">Track</button>
+      <button id="track" class="primary" type="submit">Open</button>
     </form>
     <p class="tip"><i class="ic" data-icon="lightbulb"></i> Put <code id="prefixTip">this site/</code> in front of any product link in your address bar to open it here. Works with Amazon, Flipkart, Myntra, Zepto, Blinkit, Instamart, Tata CLiQ, Vijay Sales, Samsung, Apple and most brand stores; Croma, Reliance Digital, Nykaa, Ajio, Meesho, BigBasket and Snapdeal need the <button type="button" class="linkish" data-open-settings>Track price bookmark</button>.</p>
 
@@ -130,6 +130,12 @@
       <button class="close" data-close aria-label="Close"><i class="ic" data-icon="x"></i></button>
     </div>
     <p id="hMeta" class="muted"></p>
+    <p id="hArchive" class="muted archive-note" hidden></p>
+    <div class="sheet-alert">
+      <label class="target"><i class="ic" data-icon="bell-ring"></i><span>Alert below</span>
+        <input id="hTarget" type="number" min="0" step="any" inputmode="decimal" placeholder="price"></label>
+      <span id="hAlertNote" class="muted"></span>
+    </div>
 
     <div class="score-row">
       <div id="hGauge" class="gauge"></div>
