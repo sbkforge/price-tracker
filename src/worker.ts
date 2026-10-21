@@ -719,13 +719,27 @@ async function backfill(env: Env, p: ProductRow, max = WAYBACK_MAX): Promise<{ o
   const now = Date.now();
   // Claim the url first so a concurrent request doesn't fetch the same snapshots.
   await env.DB.prepare("UPDATE products SET backfilled_at = ? WHERE url = ?").bind(now, p.url).run();
-  let stamps: string[] = [];
+  // The same page is captured under many address variants (tracking
+  // parameters, share links), so match everything that starts with the page's
+  // path and keep one capture per month, preferring the cleanest address.
+  let captures: Array<{ ts: string; original: string }> = [];
   try {
-    const cdx = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(p.url)}&output=json&fl=timestamp,statuscode&filter=statuscode:200&collapse=timestamp:6&limit=240`;
+    const base = p.url.split("?")[0].replace(/^https?:\/\//, "");
+    const cdx = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(base)}&matchType=prefix&output=json&fl=timestamp,original&filter=statuscode:200&filter=mimetype:text/html&limit=4000`;
     const res = await fetch(cdx, { headers: { "user-agent": UA } });
     if (!res.ok) throw new Error(String(res.status));
     const rows = (await res.json()) as string[][];
-    stamps = rows.slice(1).map((r) => r[0]).filter((t) => /^\d{14}$/.test(t));
+    const byMonth = new Map<string, { ts: string; original: string }>();
+    for (const [ts, original] of rows.slice(1)) {
+      if (!/^\d{14}$/.test(ts) || !original) continue;
+      // Only this product: same path, any query string.
+      const path = original.replace(/^https?:\/\//, "").split("?")[0];
+      if (path !== base) continue;
+      const month = ts.slice(0, 6);
+      const cur = byMonth.get(month);
+      if (!cur || original.length < cur.original.length) byMonth.set(month, { ts, original });
+    }
+    captures = [...byMonth.values()].sort((a, b) => a.ts.localeCompare(b.ts));
   } catch {
     // The archive is down or rate-limiting; release the claim for another run.
     await env.DB.prepare("UPDATE products SET backfilled_at = NULL WHERE url = ?").bind(p.url).run();
@@ -733,19 +747,19 @@ async function backfill(env: Env, p: ProductRow, max = WAYBACK_MAX): Promise<{ o
   }
 
   // Spread the budget across the whole span rather than only the newest.
-  const pick: string[] = [];
-  if (stamps.length <= max) pick.push(...stamps);
-  else for (let i = 0; i < max; i++) pick.push(stamps[Math.round((i * (stamps.length - 1)) / (max - 1))]);
+  const pick: Array<{ ts: string; original: string }> = [];
+  if (captures.length <= max) pick.push(...captures);
+  else for (let i = 0; i < max; i++) pick.push(captures[Math.round((i * (captures.length - 1)) / (max - 1))]);
 
   const existing = ((await historyByUrl(env, "?", [p.url])).get(p.url) ?? []).map((r) => r.checked_at);
   let added = 0;
   let earliest: number | null = null;
-  for (const ts of pick) {
+  for (const { ts, original } of pick) {
     const t = Date.UTC(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8), +ts.slice(8, 10), +ts.slice(10, 12), +ts.slice(12, 14));
     if (existing.some((e) => Math.abs(e - t) < 1.5 * DAY_MS)) continue;
     try {
       // "id_" returns the page as captured, without the archive's toolbar.
-      const res = await fetch(`https://web.archive.org/web/${ts}id_/${p.url}`, { headers: { "user-agent": UA }, redirect: "follow" });
+      const res = await fetch(`https://web.archive.org/web/${ts}id_/${original}`, { headers: { "user-agent": UA }, redirect: "follow" });
       if (!res.ok) continue;
       const info = await parsePage(res, p.url);
       // Only confident readings go into history: structured data or the
@@ -763,7 +777,7 @@ async function backfill(env: Env, p: ProductRow, max = WAYBACK_MAX): Promise<{ o
     }
   }
   await env.DB.prepare("UPDATE products SET backfilled_at = ? WHERE url = ?").bind(now, p.url).run();
-  return { ok: true, added, snapshots: stamps.length, earliest };
+  return { ok: true, added, snapshots: captures.length, earliest };
 }
 
 async function backfillDue(env: Env): Promise<void> {

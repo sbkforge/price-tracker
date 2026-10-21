@@ -851,22 +851,23 @@ function timeline(p: Product, h: PricePoint[], rangeDays = 0): SVGElement {
   svg.setAttribute("aria-label", `Price timeline, ${h.length} checks`);
   const readout = $("hReadout");
   readout.textContent = "";
-  if (h.length < 2) {
+  if (!h.length) {
     svg.classList.add("flat");
     svg.append(svgEl("line", { class: "line", x1: 0, x2: W, y1: H / 2, y2: H / 2 }));
-    readout.textContent = h.length ? "Only one price so far; the line grows with each check." : "No prices in this range.";
+    readout.textContent = "No prices in this range.";
     return svg;
   }
+  if (h.length === 1) readout.textContent = "One price so far; the line grows with every check.";
 
   const values = h.map((x) => x[1]);
   if (p.target != null) values.push(p.target);
   let lo = Math.min(...values);
   let hi = Math.max(...values);
-  if (hi === lo) { hi += 1; lo -= 1; }
+  if (hi === lo) { hi *= 1.05; lo *= 0.95; }
   const pad = (hi - lo) * 0.08;
   lo -= pad; hi += pad;
   const now = Date.now();
-  const t0 = rangeDays ? now - rangeDays * DAY : h[0][0];
+  const t0 = rangeDays ? now - rangeDays * DAY : Math.min(h[0][0], now - 7 * DAY);
   const t1 = Math.max(now, h[h.length - 1][0]);
   const span = (t1 - t0) || 1;
   const x = (t: number) => L + ((t - t0) / span) * (W - L - R);
@@ -896,20 +897,22 @@ function timeline(p: Product, h: PricePoint[], rangeDays = 0): SVGElement {
 
   // Line and area, over the dates that have data
   const first = h[0][0], last = h[h.length - 1][0];
-  const d = smoothPath(h.map(([t, v]) => [x(t), y(v)]));
-  const gid = `tl${p.id}`;
-  const defs = svgEl("defs", {});
-  const grad = svgEl("linearGradient", { id: gid, x1: 0, x2: 0, y1: 0, y2: 1 });
-  grad.append(svgEl("stop", { offset: "0%", class: "stop-a" }), svgEl("stop", { offset: "100%", class: "stop-b" }));
-  defs.append(grad);
-  svg.append(
-    defs,
-    svgEl("path", { class: "area", d: `${d} L ${x(last).toFixed(1)} ${H - B} L ${x(first).toFixed(1)} ${H - B} Z`, fill: `url(#${gid})` }),
-    svgEl("path", { class: "line", d }),
-  );
+  if (h.length >= 2) {
+    const d = smoothPath(h.map(([t, v]) => [x(t), y(v)]));
+    const gid = `tl${p.id}`;
+    const defs = svgEl("defs", {});
+    const grad = svgEl("linearGradient", { id: gid, x1: 0, x2: 0, y1: 0, y2: 1 });
+    grad.append(svgEl("stop", { offset: "0%", class: "stop-a" }), svgEl("stop", { offset: "100%", class: "stop-b" }));
+    defs.append(grad);
+    svg.append(
+      defs,
+      svgEl("path", { class: "area", d: `${d} L ${x(last).toFixed(1)} ${H - B} L ${x(first).toFixed(1)} ${H - B} Z`, fill: `url(#${gid})` }),
+      svgEl("path", { class: "line", d }),
+    );
+  }
   // The price holds from the last check until now: a faint continuation.
-  if (now - last > 60 * 60 * 1000) {
-    svg.append(svgEl("line", { class: "hold", x1: x(last), x2: x(now), y1: y(h[h.length - 1][1]), y2: y(h[h.length - 1][1]) }));
+  if (now - last > 60 * 60 * 1000 || h.length === 1) {
+    svg.append(svgEl("line", { class: "hold", x1: x(last), x2: x(Math.max(now, last)), y1: y(h[h.length - 1][1]), y2: y(h[h.length - 1][1]) }));
   }
   if (p.target != null) {
     svg.append(svgEl("line", { class: "target", x1: L, x2: W - R, y1: y(p.target), y2: y(p.target) }));
@@ -919,7 +922,7 @@ function timeline(p: Product, h: PricePoint[], rangeDays = 0): SVGElement {
   const lowIdx = h.findIndex(([, v]) => v === Math.min(...h.map((q) => q[1])));
   const highIdx = h.findIndex(([, v]) => v === Math.max(...h.map((q) => q[1])));
   for (const [idx, cls] of [[highIdx, "hi"], [lowIdx, "lo"]] as const) {
-    if (idx < 0) continue;
+    if (idx < 0 || (h.length === 1 && cls === "hi")) continue;
     const [t, v] = h[idx];
     svg.append(svgEl("circle", { class: `mark ${cls}`, cx: x(t), cy: y(v), r: 4 }));
     const left = x(t) > W * 0.7;
