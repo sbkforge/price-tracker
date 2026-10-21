@@ -21,7 +21,7 @@ export interface Env {
 }
 
 const CHECK_EVERY = 6 * 60 * 60 * 1000; // re-check a product every 6 hours
-const BATCH = 25; // products per scheduled run (free plan allows 50 fetches)
+const BATCH = 20; // products per scheduled run (free plan allows 50 fetches; discovery needs a few)
 const OWNER_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
@@ -54,6 +54,8 @@ export default {
 
       // Public: biggest recent price drops across everyone (no owner info).
       if (path === "/api/deals" && method === "GET") return await deals(env);
+      // Public: the auto-discovered catalog of popular products.
+      if (path === "/api/catalog" && method === "GET") return await catalog(env);
 
       // Every visitor sends their own random owner id; it scopes everything.
       const owner = request.headers.get("x-owner") || "";
@@ -109,7 +111,7 @@ export default {
   },
 
   async scheduled(_event, env, ctx): Promise<void> {
-    ctx.waitUntil(checkDue(env));
+    ctx.waitUntil(checkDue(env).then(() => discover(env)));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -344,6 +346,104 @@ async function historyCsv(env: Env, p: ProductRow): Promise<Response> {
       "cache-control": "no-store",
     },
   });
+}
+
+// ---------- catalog: popular products tracked without anyone adding them ----------
+//
+// Each scheduled run searches one category on Flipkart (the one store whose
+// search page can be read) and starts tracking the top results under the
+// shared "catalog" owner. They're checked like everything else, so Deals and
+// Browse fill up on their own. Capped so the cron budget stays within limits.
+
+const CATALOG_OWNER = "catalog";
+const CATALOG_MAX = 400;
+const CATALOG_PER_RUN = 6;
+// Specific searches with a price floor: generic words ("camera") return
+// straps and lens caps, so each query names the kind of product and the least
+// it plausibly costs.
+const CATALOG_QUERIES: Array<{ q: string; min: number }> = [
+  { q: "iphone 16", min: 40000 }, { q: "iphone 17", min: 50000 }, { q: "samsung galaxy s25", min: 40000 },
+  { q: "samsung galaxy a55", min: 15000 }, { q: "oneplus 13", min: 25000 }, { q: "oneplus nord", min: 15000 },
+  { q: "redmi note 14", min: 10000 }, { q: "realme narzo", min: 8000 }, { q: "vivo t4", min: 10000 },
+  { q: "google pixel 9", min: 40000 }, { q: "motorola edge", min: 15000 }, { q: "nothing phone", min: 15000 },
+  { q: "macbook air m4", min: 70000 }, { q: "macbook pro", min: 120000 }, { q: "dell laptop i5", min: 35000 },
+  { q: "hp laptop i5", min: 35000 }, { q: "lenovo ideapad laptop", min: 30000 }, { q: "asus gaming laptop", min: 50000 },
+  { q: "ipad", min: 25000 }, { q: "samsung galaxy tab", min: 12000 }, { q: "apple watch", min: 20000 },
+  { q: "samsung galaxy watch", min: 10000 }, { q: "noise smartwatch", min: 1500 }, { q: "boat airdopes", min: 800 },
+  { q: "sony wh-1000xm5", min: 15000 }, { q: "jbl bluetooth speaker", min: 2000 }, { q: "airpods pro", min: 15000 },
+  { q: "samsung 55 inch smart tv", min: 30000 }, { q: "lg oled tv", min: 80000 }, { q: "sony bravia tv", min: 40000 },
+  { q: "lg refrigerator double door", min: 20000 }, { q: "samsung washing machine front load", min: 20000 },
+  { q: "philips air fryer", min: 5000 }, { q: "preethi mixer grinder", min: 3000 }, { q: "daikin 1.5 ton split ac", min: 30000 },
+  { q: "samsung microwave oven", min: 7000 }, { q: "dyson vacuum cleaner", min: 20000 }, { q: "canon dslr camera", min: 30000 },
+  { q: "sony mirrorless camera", min: 50000 }, { q: "gopro hero", min: 20000 }, { q: "playstation 5 console", min: 35000 },
+  { q: "lg 27 inch monitor", min: 10000 }, { q: "nike running shoes men", min: 2500 }, { q: "adidas running shoes", min: 2500 },
+  { q: "american tourister backpack", min: 1200 }, { q: "philips trimmer", min: 1000 }, { q: "mi power bank 20000mah", min: 1200 },
+  { q: "kindle paperwhite", min: 10000 }, { q: "dyson airwrap", min: 30000 }, { q: "lego set", min: 1500 },
+];
+
+async function setting(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
+  return row ? row.value : null;
+}
+
+async function setSetting(env: Env, key: string, value: string): Promise<void> {
+  await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .bind(key, value).run();
+}
+
+async function discover(env: Env): Promise<void> {
+  const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM products WHERE owner = ?")
+    .bind(CATALOG_OWNER).first<{ n: number }>();
+  if ((total?.n ?? 0) >= CATALOG_MAX) return;
+
+  // One category per run, round robin, remembered between runs.
+  const slot = (Number(await setting(env, "catalog_slot")) + 1) % CATALOG_QUERIES.length;
+  await setSetting(env, "catalog_slot", String(slot));
+  const { q, min } = CATALOG_QUERIES[slot];
+  let hits: ReturnType<typeof parseFlipkartSearch>;
+  try {
+    // Sorted by popularity, so the catalog gets the products people buy.
+    const res = await fetchPage(`https://www.flipkart.com/search?q=${encodeURIComponent(q)}&marketplace=FLIPKART&sort=popularity`);
+    if (!res.ok) return;
+    hits = parseFlipkartSearch(await res.text());
+  } catch {
+    return;
+  }
+
+  const now = Date.now();
+  let added = 0;
+  // One entry per model: "OnePlus 13 (Black Eclipse, 512 GB)" and its other
+  // colours share a key, so a run brings variety rather than six colours.
+  const seenModels = new Set<string>();
+  for (const h of hits) {
+    if (added >= CATALOG_PER_RUN) break;
+    if (h.price == null || h.price < min) continue;
+    const model = h.title.replace(/\(([^,)]*),\s*/, "(").toLowerCase();
+    if (seenModels.has(model)) continue;
+    seenModels.add(model);
+    const url = await canonicalUrl(new URL(h.url));
+    const dupe = await env.DB.prepare("SELECT id FROM products WHERE owner = ? AND url = ?")
+      .bind(CATALOG_OWNER, url.href).first();
+    if (dupe) continue;
+    // The listing's own data is enough to start; the next check reads the page.
+    const row = await env.DB.prepare(
+      `INSERT INTO products (owner, url, title, image, store, currency, price, availability, render, created_at, checked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?) RETURNING id`
+    ).bind(CATALOG_OWNER, url.href, h.title.slice(0, 200), h.image, storeName(url), h.currency || "INR",
+      h.price, "in_stock", now, now - CHECK_EVERY).first<{ id: number }>();
+    if (row) {
+      await env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
+        .bind(row.id, h.price, now).run();
+      added++;
+    }
+  }
+}
+
+async function catalog(env: Env): Promise<Response> {
+  const products = (await productsFor(env, CATALOG_OWNER)).map((p) => ({
+    ...p, owner: "", target: null, bought_at: null, bought_price: null,
+  }));
+  return json({ products }, 200, { "cache-control": "public, max-age=300" });
 }
 
 // ---------- deals feed ----------

@@ -193,6 +193,12 @@ section("Share, search, deals");
 
   const deals = await api("/api/deals", { as: null });
   ok("Deals feed", deals.status === 200 && Array.isArray(deals.data.deals), `${deals.data.deals?.length} deals`);
+  const cat = await api("/api/catalog", { as: null });
+  ok("Catalog is public and read-only", cat.status === 200 && Array.isArray(cat.data.products) && cat.data.products.every((p) => p.owner === "" && p.target === null), `${cat.data.products?.length} products`);
+  if (cat.data.products?.length) {
+    const c = cat.data.products[0];
+    ok("Catalog products carry history and a store", c.history.length >= 1 && c.price > 0 && c.store && c.title, `${c.store} · ${c.title.slice(0, 40)} · ${c.history.length} checks`);
+  }
   const insp = await api(`/api/inspect?url=${encodeURIComponent("https://www.amazon.in/dp/B0BDK62PDX")}`);
   ok("Unavailable Amazon listing isn't given a made-up price", insp.status === 200 && insp.data.price === null, insp.data.error || `price ${insp.data.price}`);
 }

@@ -51,6 +51,10 @@ If the plain fetch finds no price, or the store answers a `BLOCKED` status (403/
 
 Share/short links (`dl.flipkart.com`, `amzn.in`, ...) are resolved by `canonicalUrl`, which also strips tracking params; that canonical URL is what's stored and deduped on. Flipkart's `dl.flipkart.com` answers Cloudflare with 529, which is why the browser fallback exists.
 
+### Catalog (auto-discovery)
+
+`discover()` runs after each cron's checks: it takes the next entry of `CATALOG_QUERIES` (round robin, cursor in the `settings` table), searches Flipkart sorted by popularity, and inserts up to `CATALOG_PER_RUN` new products under owner `"catalog"` straight from the listing (title, price, image), one per model, skipping anything under the query's `min` price. The next cron reads their real pages like any product. `/api/catalog` serves them read-only; the page's Browse tab shows them and Deals naturally includes them. Capped at `CATALOG_MAX`. To seed quickly, run `wrangler dev --remote --test-scheduled` and hit `/__scheduled` repeatedly (it uses production D1).
+
 ### Checks and alerts
 
 `scheduled()` runs every 15 minutes (`wrangler.jsonc` `triggers`) and re-checks up to 25 products not checked in 6 hours (`CHECK_EVERY`, `BATCH`; the free plan allows 50 subrequests per invocation). `checkProduct` writes a `prices` row on success and only sets `products.error` on failure, keeping the last good price. `alertIfNeeded` pushes when the price fell (any drop without a target, or at/below the target) or an item comes back in stock; subscriptions that return 404/410 are deleted.

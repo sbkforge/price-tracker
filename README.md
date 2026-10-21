@@ -13,6 +13,7 @@ Written in TypeScript and runs entirely on Cloudflare's free plan: a Worker, a D
 - **Deals feed**: biggest drops in the last 7 days across everything people track (product facts only, never who tracks what)
 - **Compare stores**: Flipkart results inline, one-tap search links for Amazon, Croma, Reliance Digital, Vijay Sales and Tata CLiQ
 - **Share to app**: on Android, share a product link from any app straight into Price Tracker (Web Share Target); on desktop, put the site's address in front of any product link, or use the Track price bookmark
+- **Browse**: a catalog of popular products that the Worker discovers and tracks on its own (one Flipkart category search per cron run, popularity-sorted, with a price floor per category so accessories don't sneak in), so there's history, a deal score and deals to look at before you add anything
 - **Deal score** out of 100 with a gauge and points breakup (price pumped before the drop, above all-time low, above 30-day low, above average), like a deal scanner
 - **Search by name** (typed or spoken) with live Flipkart results you can track in one tap
 - **Share a product** (WhatsApp, copy, system share) and a **read-only link to your whole list**
@@ -58,6 +59,7 @@ Every request sends an `x-owner` header: a random 16–64 character id the page 
 |---|---|
 | `GET /api/config` | Public push key and limits |
 | `GET /api/deals` | Public feed of the biggest drops in the last 7 days |
+| `GET /api/catalog` | The auto-discovered catalog (public, read-only) |
 | `GET /api/share` | Create/get a read-only share token for this owner's list |
 | `GET /api/shared/<token>` | A shared list (targets and purchases stripped) |
 | `POST /api/products` with `snapshot` | Add or refresh a product from what the Track price bookmark read in the browser |

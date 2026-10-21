@@ -1,7 +1,7 @@
 // Price Tracker page. Built with esbuild into public/app.js.
 
 import {
-  createElement as lucide, Bell, BellRing, BookmarkPlus, Check, Copy, Download, ExternalLink, Flame, History,
+  createElement as lucide, Bell, BellRing, BookmarkPlus, Check, Compass, Copy, Download, ExternalLink, Flame, History,
   Lightbulb, Link, MessageCircle, Mic, Plus, RefreshCw, Search, Settings, Share2, ShoppingBag, SlidersHorizontal,
   Tag, Tags, Trash2, Undo2, X,
 } from "lucide";
@@ -14,7 +14,7 @@ import type {
 // ---------- icons (Lucide) ----------
 
 const ICONS: Record<string, IconNode> = {
-  bell: Bell, "bell-ring": BellRing, "bookmark-plus": BookmarkPlus, check: Check, copy: Copy, download: Download,
+  bell: Bell, "bell-ring": BellRing, "bookmark-plus": BookmarkPlus, check: Check, compass: Compass, copy: Copy, download: Download,
   "external-link": ExternalLink, flame: Flame, history: History, lightbulb: Lightbulb, link: Link,
   "message-circle": MessageCircle, mic: Mic, plus: Plus, "refresh-cw": RefreshCw, search: Search,
   settings: Settings, "share-2": Share2, "shopping-bag": ShoppingBag, "sliders-horizontal": SlidersHorizontal,
@@ -40,7 +40,7 @@ function pill(name: keyof typeof ICONS, label: string, cls = "pill"): HTMLButton
   return b;
 }
 
-type Filter = "all" | "dropped" | "alerts" | "target" | "out" | "bought" | "deals";
+type Filter = "all" | "browse" | "dropped" | "alerts" | "target" | "out" | "bought" | "deals";
 type Sort = "recent" | "drop" | "score" | "low" | "high" | "name";
 type Mode = "list" | "search" | "shared";
 
@@ -53,6 +53,7 @@ const state = {
   loaded: false,
   config: null as ConfigResponse | null,
   deals: null as Deal[] | null,
+  catalog: null as Product[] | null,
   dealCat: "all",
   dealMin: 0,
   search: { query: "", hits: [] as CompareHit[], blocked: [] as string[], loading: false },
@@ -349,13 +350,18 @@ function render(): void {
   document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
     b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter))
   );
-  $("dealsBar").hidden = state.filter !== "deals" || state.mode === "search";
+  $("dealsBar").hidden = (state.filter !== "deals" && state.filter !== "browse") || state.mode === "search";
+  $("dealMin").hidden = state.filter !== "deals";
   $("searchHead").hidden = state.mode !== "search";
   $("sharedBanner").hidden = state.mode !== "shared";
 
   if (state.mode === "search") return renderSearch();
   if (state.filter === "deals") {
     void renderDeals();
+    return;
+  }
+  if (state.filter === "browse") {
+    void renderBrowse();
     return;
   }
 
@@ -460,6 +466,47 @@ $("voice").addEventListener("click", () => {
   r.start();
 });
 
+// ---------- browse: the auto-discovered catalog ----------
+
+function categoryChips(titles: string[]): void {
+  const cats = new Map<string, number>();
+  for (const t of titles) cats.set(categoryOf(t), (cats.get(categoryOf(t)) ?? 0) + 1);
+  if (!cats.has(state.dealCat) && state.dealCat !== "all") state.dealCat = "all";
+  const chips = $("dealCats");
+  chips.replaceChildren(...[["all", "All"], ...[...cats.keys()].sort().map((c) => [c, c])].map(([key, label]) => {
+    const b = el("button", undefined, label === "All" ? `All · ${titles.length}` : `${label} · ${cats.get(key)}`);
+    b.setAttribute("aria-pressed", String(state.dealCat === key));
+    b.addEventListener("click", () => { state.dealCat = key; render(); });
+    return b;
+  }));
+}
+
+async function renderBrowse(): Promise<void> {
+  $("heading").textContent = "Browse";
+  $("subtitle").textContent = "Popular products tracked automatically, with history and a deal score before you add anything. Tap Track this to put one on your list.";
+  $("skeleton").hidden = !!state.catalog;
+  if (!state.catalog) {
+    $("products").replaceChildren();
+    setEmpty(false);
+    try {
+      const data = await api<ListResponse>("/api/catalog");
+      state.catalog = data.products;
+    } catch (err) {
+      toast(`Could not load the catalog: ${(err as Error).message}`, "error");
+      state.catalog = [];
+    }
+    if (state.filter !== "browse" || state.mode === "search") return;
+    $("skeleton").hidden = true;
+  }
+  categoryChips(state.catalog.map((p) => p.title));
+  const q = state.query.toLowerCase();
+  const list = visible(state.catalog.filter((p) => state.dealCat === "all" || categoryOf(p.title) === state.dealCat))
+    .filter((p) => !q || `${p.title} ${p.store}`.toLowerCase().includes(q));
+  setEmpty(list.length === 0, state.catalog.length ? "Nothing here" : "The catalog is filling up",
+    state.catalog.length ? "Try another category." : "New products are discovered every 15 minutes. Check back soon, or search for one above.");
+  $("products").replaceChildren(...list.map((p) => card(p, true)));
+}
+
 // ---------- deals feed ----------
 
 async function renderDeals(): Promise<void> {
@@ -481,16 +528,7 @@ async function renderDeals(): Promise<void> {
   }
 
   // Category chips from what's actually on offer.
-  const cats = new Map<string, number>();
-  for (const d of state.deals) cats.set(categoryOf(d.title), (cats.get(categoryOf(d.title)) ?? 0) + 1);
-  if (!cats.has(state.dealCat) && state.dealCat !== "all") state.dealCat = "all";
-  const chips = $("dealCats");
-  chips.replaceChildren(...[["all", "All"], ...[...cats.keys()].sort().map((c) => [c, c])].map(([key, label]) => {
-    const b = el("button", undefined, label === "All" ? label : `${label} · ${cats.get(key)}`);
-    b.setAttribute("aria-pressed", String(state.dealCat === key));
-    b.addEventListener("click", () => { state.dealCat = key; render(); });
-    return b;
-  }));
+  categoryChips(state.deals.map((d) => d.title));
 
   const q = state.query.toLowerCase();
   const list = state.deals.filter((d) =>
@@ -634,6 +672,8 @@ function card(p: Product, readOnly = false): HTMLElement {
     track.addEventListener("click", () => trackUrl(p.url, track));
     foot.append(history, el("span", "spacer"), track);
     c.append(foot);
+    // Catalog and shared products are read-only here, but their history is real.
+    c.classList.add("readonly");
     return c;
   }
 
@@ -1172,6 +1212,7 @@ document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
     state.filter = (b.dataset.filter as Filter) || "all";
     if (state.mode === "search") state.mode = state.shared ? "shared" : "list";
     if (state.filter === "deals") state.deals = null; // refresh each visit
+    if (state.filter === "browse") state.catalog = null;
     render();
   })
 );
