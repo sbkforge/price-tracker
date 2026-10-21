@@ -4,11 +4,11 @@
 
 import puppeteer from "@cloudflare/puppeteer";
 import type { BrowserWorker } from "@cloudflare/puppeteer";
-import { sendPush } from "./push";
+import { b64url, sendPush } from "./push";
 import type { PushSubscriptionRow } from "./push";
 import { MAX_PER_OWNER } from "./shared";
 import type {
-  AddRequest, Availability, PricePoint, Product, ProductRow, PushSubscribeRequest, TargetRequest,
+  AddRequest, Availability, PricePoint, Product, ProductRow, PushSubscribeRequest, Snapshot, UpdateRequest,
 } from "./shared";
 
 export interface Env {
@@ -32,6 +32,17 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname;
       const method = request.method;
+
+      // "Put our address in front of any product link": /https://store/... opens
+      // the page with that product ready to track.
+      if (/^\/https?:\/\//i.test(path) && method === "GET") {
+        const target = request.url.slice(url.origin.length + 1);
+        return Response.redirect(`${url.origin}/?url=${encodeURIComponent(target)}`, 302);
+      }
+
+      // Public, read-only view of someone's shared list.
+      const sharedMatch = /^\/api\/shared\/([A-Za-z0-9_-]{16,64})$/.exec(path);
+      if (sharedMatch && method === "GET") return await sharedList(env, sharedMatch[1]);
 
       if (path === "/api/config" && method === "GET") {
         return json({
@@ -64,6 +75,7 @@ export default {
 
       if (path === "/api/products" && method === "GET") return await listProducts(env, owner);
       if (path === "/api/products" && method === "POST") return await addProduct(request, env, owner);
+      if (path === "/api/share" && method === "GET") return await shareLink(env, owner, url.origin);
 
       if (path === "/api/push" && method === "POST") return await subscribe(request, env, owner);
       if (path === "/api/push" && method === "DELETE") return await unsubscribe(request, env, owner);
@@ -104,6 +116,10 @@ export default {
 // ---------- products ----------
 
 async function listProducts(env: Env, owner: string): Promise<Response> {
+  return json({ products: await productsFor(env, owner) }, 200, { "cache-control": "no-store" });
+}
+
+async function productsFor(env: Env, owner: string): Promise<Product[]> {
   const { results: rows } = await env.DB.prepare(
     "SELECT * FROM products WHERE owner = ? ORDER BY created_at DESC"
   ).bind(owner).all<ProductRow>();
@@ -120,7 +136,7 @@ async function listProducts(env: Env, owner: string): Promise<Response> {
     history.set(r.product_id, list);
   }
 
-  const products: Product[] = rows.map((p) => {
+  return rows.map((p) => {
     const h = history.get(p.id) ?? [];
     const values = h.map((x) => x[1]);
     const n = values.length;
@@ -133,6 +149,28 @@ async function listProducts(env: Env, owner: string): Promise<Response> {
       first: n ? values[0] : null,
     };
   });
+}
+
+// ---------- shared lists ----------
+
+async function shareLink(env: Env, owner: string, origin: string): Promise<Response> {
+  let row = await env.DB.prepare("SELECT token FROM lists WHERE owner = ?").bind(owner).first<{ token: string }>();
+  if (!row) {
+    const token = b64url(crypto.getRandomValues(new Uint8Array(18)));
+    await env.DB.prepare("INSERT INTO lists (owner, token, created_at) VALUES (?, ?, ?)")
+      .bind(owner, token, Date.now()).run();
+    row = { token };
+  }
+  return json({ token: row.token, url: `${origin}/?list=${row.token}` });
+}
+
+async function sharedList(env: Env, token: string): Promise<Response> {
+  const row = await env.DB.prepare("SELECT owner FROM lists WHERE token = ?").bind(token).first<{ owner: string }>();
+  if (!row) return json({ error: "That shared list doesn't exist" }, 404);
+  // Strip anything personal: targets and purchases stay with the owner.
+  const products = (await productsFor(env, row.owner)).map((p) => ({
+    ...p, owner: "", target: null, bought_at: null, bought_price: null,
+  }));
   return json({ products }, 200, { "cache-control": "no-store" });
 }
 
@@ -147,9 +185,18 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
   }
   url = await canonicalUrl(url);
 
-  const existing = await env.DB.prepare("SELECT id FROM products WHERE owner = ? AND url = ?")
-    .bind(owner, url.href).first();
-  if (existing) return json({ error: "You're already tracking that product" }, 409);
+  const snapshot = cleanSnapshot(body.snapshot);
+
+  const existing = await env.DB.prepare("SELECT * FROM products WHERE owner = ? AND url = ?")
+    .bind(owner, url.href).first<ProductRow>();
+  if (existing) {
+    // The bookmark on a page already tracked: record what it saw as a fresh check.
+    if (snapshot) {
+      await recordSnapshot(env, existing, snapshot);
+      return json({ ok: true, id: existing.id, price: snapshot.price, currency: snapshot.currency, via: "bookmark", updated: true });
+    }
+    return json({ error: "You're already tracking that product" }, 409);
+  }
   const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM products WHERE owner = ?")
     .bind(owner).first<{ n: number }>();
   if ((count?.n ?? 0) >= MAX_PER_OWNER) {
@@ -157,8 +204,23 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
   }
 
   let info = await readProduct(url.href, env, "auto");
+  if (info.price == null && snapshot) {
+    // The Worker couldn't read the page, but the person's browser could.
+    info = {
+      title: snapshot.title || info.title || url.hostname,
+      image: snapshot.image ?? info.image,
+      price: snapshot.price,
+      currency: snapshot.currency ?? info.currency ?? null,
+      availability: snapshot.availability ?? info.availability,
+      listPrice: snapshot.listPrice ?? null,
+      via: "bookmark",
+    };
+  }
   if (info.price == null) {
-    return json({ error: info.error || "Couldn't find a price on that page" }, 422);
+    const hint = BLOCKED_STORES.test(url.hostname)
+      ? ` ${storeName(url)} blocks automatic checks. Open the product page and use the "Track price" bookmark (in Settings) to add it from your browser.`
+      : "";
+    return json({ error: (info.error || "Couldn't find a price on that page") + hint }, 422);
   }
 
   // A share link that redirected: keep the real product page, and see if it
@@ -191,10 +253,54 @@ async function addProduct(request: Request, env: Env, owner: string): Promise<Re
   return json({ ok: true, id: row.id, price: info.price, currency: info.currency, via: info.via }, 201);
 }
 
+// Stores known to turn away Cloudflare, headless browser included. Their
+// products come in through the bookmark instead.
+const BLOCKED_STORES = /(^|\.)(croma\.com|reliancedigital\.in|nykaa\.com|ajio\.com|meesho\.com|bigbasket\.com|snapdeal\.com)$/i;
+
+function cleanSnapshot(s: Snapshot | undefined): Snapshot | null {
+  if (!s || typeof s !== "object") return null;
+  const price = toNumber(s.price);
+  if (price == null || !(price > 0)) return null;
+  const listPrice = toNumber(s.listPrice);
+  return {
+    title: s.title ? String(s.title).replace(/\s+/g, " ").trim().slice(0, 200) : undefined,
+    price,
+    currency: s.currency && /^[A-Z]{3}$/.test(String(s.currency)) ? String(s.currency) : null,
+    image: s.image && /^https?:\/\//.test(String(s.image)) ? String(s.image).slice(0, 500) : null,
+    availability: availabilityOf(s.availability),
+    listPrice: listPrice != null && listPrice > price ? listPrice : null,
+  };
+}
+
+async function recordSnapshot(env: Env, p: ProductRow, s: Snapshot): Promise<void> {
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE products SET price = ?, currency = COALESCE(?, currency), error = NULL,
+       availability = COALESCE(?, availability), list_price = COALESCE(?, list_price),
+       image = COALESCE(image, ?), title = COALESCE(?, title), checked_at = ? WHERE id = ?`
+    ).bind(s.price, s.currency ?? null, s.availability ?? null, s.listPrice ?? null, s.image ?? null, s.title ?? null, now, p.id),
+    env.DB.prepare("INSERT INTO prices (product_id, price, checked_at) VALUES (?, ?, ?)")
+      .bind(p.id, s.price, now),
+  ]);
+  const info: PageInfo = {
+    title: s.title || p.title, image: s.image ?? p.image, price: s.price, currency: s.currency ?? p.currency,
+    availability: s.availability ?? p.availability, listPrice: s.listPrice ?? null,
+  };
+  await alertIfNeeded(env, p, info);
+}
+
 async function updateProduct(request: Request, env: Env, id: number): Promise<Response> {
-  const body = (await request.json().catch(() => ({}))) as Partial<TargetRequest>;
-  await env.DB.prepare("UPDATE products SET target = ? WHERE id = ?")
-    .bind(toNumber(body.target), id).run();
+  const body = (await request.json().catch(() => ({}))) as UpdateRequest;
+  if ("target" in body) {
+    await env.DB.prepare("UPDATE products SET target = ? WHERE id = ?")
+      .bind(toNumber(body.target), id).run();
+  }
+  if ("bought" in body) {
+    const price = body.bought ? toNumber(body.bought.price) : null;
+    await env.DB.prepare("UPDATE products SET bought_at = ?, bought_price = ? WHERE id = ?")
+      .bind(body.bought ? Date.now() : null, price, id).run();
+  }
   return json({ ok: true });
 }
 
@@ -338,7 +444,10 @@ async function checkProduct(env: Env, p: ProductRow): Promise<{ price?: number; 
 
   if (info.price == null) {
     // Keep the last good price; just note what went wrong.
-    const error = info.error || "Couldn't find a price";
+    let error = info.error || "Couldn't find a price";
+    if (BLOCKED_STORES.test(new URL(p.url).hostname)) {
+      error = `${p.store} blocks automatic checks. Open the product page and click the "Track price" bookmark to record today's price.`;
+    }
     await env.DB.prepare("UPDATE products SET error = ?, checked_at = ? WHERE id = ?")
       .bind(error, now, p.id).run();
     return { error };
@@ -361,6 +470,7 @@ async function checkProduct(env: Env, p: ProductRow): Promise<{ price?: number; 
 // Alert on a price drop (any drop without a target, or when the target is
 // reached), and when something comes back in stock.
 async function alertIfNeeded(env: Env, p: ProductRow, info: PageInfo): Promise<void> {
+  if (p.bought_at) return; // already bought; no point nagging
   const price = info.price as number;
   const dropped = p.price != null && price < p.price;
   const hit = p.target == null || price <= p.target;
@@ -517,10 +627,12 @@ async function readProduct(href: string, env: Env, mode: ReadMode | boolean): Pr
         return fail(`The store answered ${res.status}${blocked}`);
       }
       blockedBy = res.status;
+    } else if (!(res.headers.get("content-type") || "").includes("html")) {
+      // Some app-style stores answer plain requests with JSON or a shell;
+      // a real browser still gets the page.
+      if (!canRender) return fail("That link isn't a web page");
+      blockedBy = -1;
     } else {
-      if (!(res.headers.get("content-type") || "").includes("html")) {
-        return fail("That link isn't a web page");
-      }
       const info = await parsePage(res, res.url || href);
       info.finalUrl = res.url || href;
       if (info.price != null || !canRender) return info;
@@ -531,7 +643,7 @@ async function readProduct(href: string, env: Env, mode: ReadMode | boolean): Pr
   // away plain requests.
   const info = await renderAndParse(href, env.BROWSER as BrowserWorker);
   info.rendered = info.price != null;
-  if (info.price == null && blockedBy) {
+  if (info.price == null && blockedBy > 0) {
     info.error = `The store answered ${blockedBy} and the page didn't load in a browser either. It may be blocking automated checks.`;
   }
   return info;
@@ -609,9 +721,14 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     selectors: [] as string[],
     listSelectors: [] as string[],
     guesses: [] as string[],
+    stockText: "",
     title: "",
     image: null as string | null,
   };
+  // Big marketplaces list many other products on a page (accessories,
+  // "customers also bought"), so only their own price elements count there.
+  const host = new URL(href).hostname;
+  const marketplace = /(^|\.)(amazon\.[a-z.]+|flipkart\.com|myntra\.com|ajio\.com|meesho\.com|nykaa\.com)$/i.test(host);
   let ldText = "";
   let selText = "";
   let inSel = 0;
@@ -696,6 +813,10 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
         found.image ||= e.getAttribute("data-old-hires") || e.getAttribute("src");
       },
     })
+    .on("#availability, #outOfStock", {
+      // Amazon's stock line: "In stock" / "Currently unavailable".
+      text(t) { found.stockText += t.text; },
+    })
     .on("title", { text(t) { found.title += t.text; } })
     .transform(res)
     .arrayBuffer();
@@ -729,6 +850,13 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
     if (out.price != null) out.via = "meta";
   }
   out.availability ||= availabilityOf(meta["product:availability"] || meta["og:availability"] || found.availability);
+  const stock = found.stockText.replace(/\s+/g, " ").trim();
+  if (stock) out.availability ||= availabilityOf(stock);
+  // An unavailable listing has no real price; don't invent one from the page.
+  if (/currently unavailable|out of stock|sold out/i.test(stock)) {
+    out.availability = "out_of_stock";
+    if (out.via !== "json-ld") out.price = null;
+  }
   out.listPrice ??= toNumber(meta["product:original_price:amount"] ?? meta["og:price:standard_amount"]);
   if (out.listPrice == null && found.listSelectors.length) out.listPrice = parsePrice(found.listSelectors[0]);
 
@@ -740,7 +868,7 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
   }
 
   // 4. generic "price" elements (rendered pages mostly end up here)
-  if (out.price == null && found.guesses.length) {
+  if (out.price == null && found.guesses.length && !marketplace) {
     // Prefer the most common amount on the page: the product's own price is
     // usually repeated (sticky bar, buy box), struck-out MRPs less so.
     const counts = new Map<number, number>();
@@ -766,7 +894,9 @@ async function parsePage(res: Response, href: string): Promise<PageInfo> {
   // A list price only means something if it's above the selling price.
   if (out.listPrice != null && (out.price == null || out.listPrice <= out.price)) out.listPrice = null;
   if (out.price == null) {
-    out.error = "Couldn't find a price on that page. The store may load prices with JavaScript or block automated checks.";
+    out.error = out.availability === "out_of_stock"
+      ? "This listing is currently unavailable, so there's no price to track yet."
+      : "Couldn't find a price on that page. The store may load prices with JavaScript or block automated checks.";
     // Leave clues for /api/inspect.
     out.via = `title: ${found.title.trim().slice(0, 80)} | ld: ${found.ld.length} | meta: ${Object.keys(meta).length} | guesses: ${found.guesses.slice(0, 5).join(" ; ")}`;
   }

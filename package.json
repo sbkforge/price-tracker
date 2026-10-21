@@ -10,7 +10,9 @@
     "dev": "npm run build && wrangler dev --test-scheduled",
     "deploy": "npm run typecheck && npm run build && wrangler deploy",
     "db:local": "wrangler d1 migrations apply price-tracker --local",
-    "db:remote": "wrangler d1 migrations apply price-tracker --remote"
+    "db:remote": "wrangler d1 migrations apply price-tracker --remote",
+    "test": "node scripts/e2e.mjs http://localhost:8787",
+    "test:live": "node scripts/e2e.mjs https://price-tracker.sbk-music.workers.dev"
   },
   "devDependencies": {
     "@cloudflare/puppeteer": "^1.4.0",
@@ -18,5 +20,8 @@
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "lucide": "^1.61.0"
   }
 }

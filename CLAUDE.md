@@ -18,7 +18,7 @@ npm run deploy        # typecheck + build + wrangler deploy
 node scripts/vapid.js # new VAPID key pair: public -> wrangler.jsonc, private -> secret + .dev.vars
 ```
 
-There are no automated tests. Verify changes against real pages:
+`npm test` runs `scripts/e2e.mjs` against a local `npm run dev` (port 8787; pass another base URL as the first argument, or `npm run test:live`). It adds real Amazon.in, Flipkart and brand-store products under a throwaway owner, exercises every API the page uses (history, target, bought, check, CSV, share, search, deals, cleanup) and reports pass/fail/skipped; stores that block or rate-limit count as skipped unless marked required. There are no unit tests. For a single parser question, inspect real pages:
 
 ```sh
 curl -s "localhost:8787/__scheduled?cron=*/15+*+*+*+*"                       # run the price check now

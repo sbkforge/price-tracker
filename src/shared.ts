@@ -19,6 +19,9 @@ export interface ProductRow {
   list_price: number | null;
   /** 1 when the page needs a real browser (prices loaded with JavaScript). */
   render: number;
+  /** Set when the person marked it as bought. */
+  bought_at: number | null;
+  bought_price: number | null;
   created_at: number;
   checked_at: number | null;
 }
@@ -39,13 +42,32 @@ export interface ListResponse {
   products: Product[];
 }
 
+/** What the "Track price" bookmark reads on the product page itself, for stores that block the Worker. */
+export interface Snapshot {
+  title?: string;
+  price: number;
+  currency?: string | null;
+  image?: string | null;
+  availability?: Availability;
+  listPrice?: number | null;
+}
+
 export interface AddRequest {
   url: string;
   target?: number | string | null;
+  snapshot?: Snapshot;
 }
 
-export interface TargetRequest {
-  target: number | null;
+/** PATCH /api/products/:id. Only the fields present are changed. */
+export interface UpdateRequest {
+  target?: number | null;
+  /** `{ price }` marks it bought at that price; `null` clears it. */
+  bought?: { price: number } | null;
+}
+
+export interface ShareResponse {
+  token: string;
+  url: string;
 }
 
 export interface CheckResponse {

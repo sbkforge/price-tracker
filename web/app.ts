@@ -1,13 +1,16 @@
 // Price Tracker page. Built with esbuild into public/app.js.
 
 import type {
-  CheckResponse, CompareResponse, ConfigResponse, Deal, DealsResponse, ListResponse, PricePoint, Product,
+  CheckResponse, CompareHit, CompareResponse, ConfigResponse, Deal, DealsResponse, ListResponse,
+  PricePoint, Product, ShareResponse, Snapshot, UpdateRequest,
 } from "../src/shared";
 
-type Filter = "all" | "dropped" | "target" | "out" | "deals";
-type Sort = "recent" | "drop" | "low" | "high" | "name";
+type Filter = "all" | "dropped" | "alerts" | "target" | "out" | "bought" | "deals";
+type Sort = "recent" | "drop" | "score" | "low" | "high" | "name";
+type Mode = "list" | "search" | "shared";
 
 const state = {
+  mode: "list" as Mode,
   products: [] as Product[],
   filter: "all" as Filter,
   sort: "recent" as Sort,
@@ -15,6 +18,10 @@ const state = {
   loaded: false,
   config: null as ConfigResponse | null,
   deals: null as Deal[] | null,
+  dealCat: "all",
+  dealMin: 0,
+  search: { query: "", hits: [] as CompareHit[], blocked: [] as string[], loading: false },
+  shared: null as { token: string; products: Product[] } | null,
 };
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
@@ -98,6 +105,10 @@ function money(value: number | null, currency: string | null): string {
   }
 }
 
+/** Rounds to whole units when the product's prices are whole (most INR listings). */
+const tidy = (p: Product, v: number | null): number | null =>
+  v != null && p.price != null && Number.isInteger(p.price) ? Math.round(v) : v;
+
 function ago(ms: number | null): string {
   if (!ms) return "never";
   const s = Math.round((Date.now() - ms) / 1000);
@@ -109,6 +120,10 @@ function ago(ms: number | null): string {
 
 const when = (ms: number) =>
   new Date(ms).toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
+const dateShort = (ms: number) =>
+  new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+const dateLong = (ms: number) =>
+  new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K, cls?: string, text?: string | null
@@ -119,11 +134,106 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return e;
 }
 
-// ---------- buy-or-wait verdict ----------
-//
-// Judged only from what this tracker has seen: the current price against
-// the lowest and the average so far. Needs a few checks before it speaks.
+const isUrl = (s: string): boolean => /^https?:\/\/\S+$/i.test(s.trim());
 
+// ---------- categories (for Deals and "Deals in this category") ----------
+
+const CATEGORIES: Array<[string, RegExp]> = [
+  ["Phones", /\b(phone|iphone|galaxy|pixel|redmi|realme|oneplus|vivo|oppo|poco|smartphone|5g)\b/i],
+  ["Laptops", /\b(laptop|macbook|notebook|chromebook|thinkpad|ideapad|vivobook|zenbook|pavilion|inspiron)\b/i],
+  ["Tablets", /\b(ipad|tablet|tab s|galaxy tab)\b/i],
+  ["Audio", /\b(earbuds|earphones|headphones|airpods|airdopes|speaker|soundbar|tws|buds)\b/i],
+  ["Watches", /\b(smartwatch|smart watch|watch|band)\b/i],
+  ["TVs", /\b(tv|television|smart tv|oled|qled)\b/i],
+  ["Cameras", /\b(camera|dslr|mirrorless|gopro|lens)\b/i],
+  ["Gaming", /\b(playstation|ps5|xbox|nintendo|gaming|controller|console)\b/i],
+  ["Appliances", /\b(fridge|refrigerator|washing machine|air fryer|microwave|mixer|grinder|ac|air conditioner|purifier|vacuum|dishwasher|cooler|geyser|fan)\b/i],
+  ["Fashion", /\b(shirt|t-shirt|tshirt|jeans|dress|kurta|saree|jacket|hoodie|shoes|sneakers|sandals|trousers|shorts)\b/i],
+  ["Beauty", /\b(serum|moisturizer|shampoo|lipstick|foundation|perfume|sunscreen|face wash|hair oil)\b/i],
+  ["Home", /\b(sofa|chair|table|mattress|bedsheet|pillow|lamp|curtain|cookware|bottle)\b/i],
+  ["Sports", /\b(backpack|cycle|bicycle|treadmill|dumbbell|yoga|cricket|football|tent|hiking|camping)\b/i],
+  ["Books", /\b(book|novel|paperback|hardcover)\b/i],
+];
+
+function categoryOf(title: string): string {
+  for (const [name, re] of CATEGORIES) if (re.test(title)) return name;
+  return "Other";
+}
+
+// ---------- deal score (Buyhatke-style, from our own history) ----------
+//
+// Starts at 100 and loses points for signs that "the deal" isn't one:
+// the price being above its lows and average, and a price pump (a rise
+// shortly before the current drop). Needs a few checks to mean anything.
+
+interface ScoreLine { label: string; points: number; detail: string }
+interface DealScore {
+  score: number | null;           // 0..100, or null when there isn't enough history
+  label: string;
+  kind: "great" | "good" | "meh" | "bad" | "new";
+  lines: ScoreLine[];
+  pump: boolean;
+}
+
+function dealScore(p: Product): DealScore {
+  const h = p.history;
+  const n = h.length;
+  if (p.price == null || n < 3 || p.lowest == null || p.average == null) {
+    return {
+      score: null, kind: "new", label: "Not enough history yet", pump: false,
+      lines: [{ label: "Checks so far", points: 0, detail: `${n} of the 3 needed` }],
+    };
+  }
+  const price = p.price;
+  const lines: ScoreLine[] = [];
+
+  // 1. Price pump: did it climb and then "drop" to where it already was?
+  const recent = h.filter(([t]) => t >= Date.now() - 30 * DAY);
+  let pump = false;
+  if (recent.length >= 3) {
+    const peakIdx = recent.reduce((best, pt, i) => (pt[1] > recent[best][1] ? i : best), 0);
+    const before = recent.slice(0, peakIdx).map((x) => x[1]);
+    const peak = recent[peakIdx][1];
+    const base = before.length ? Math.min(...before) : null;
+    pump = base != null && peak > base * 1.05 && price < peak && price >= base * 0.98;
+  }
+  lines.push({
+    label: "Price hiked before this drop", points: pump ? 36 : 0,
+    detail: pump ? "It rose, then came back to about where it was" : "No pump seen",
+  });
+
+  // 2. Above the all-time low seen here
+  const vsLow = (price - p.lowest) / p.lowest;
+  lines.push({
+    label: `Above all-time low (${money(p.lowest, p.currency)})`,
+    points: Math.min(30, Math.round(vsLow * 100 * 1.5)),
+    detail: vsLow <= 0.005 ? "At the lowest seen" : `${Math.round(vsLow * 100)}% above`,
+  });
+
+  // 3. Above the 30-day low
+  const low30 = recent.length ? Math.min(...recent.map((x) => x[1])) : p.lowest;
+  const vs30 = (price - low30) / low30;
+  lines.push({
+    label: `Above 30-day low (${money(low30, p.currency)})`,
+    points: Math.min(16, Math.round(vs30 * 100)),
+    detail: vs30 <= 0.005 ? "At the 30-day low" : `${Math.round(vs30 * 100)}% above`,
+  });
+
+  // 4. Above the average
+  const vsAvg = (price - p.average) / p.average;
+  lines.push({
+    label: `Above average price (${money(tidy(p, p.average), p.currency)})`,
+    points: vsAvg > 0 ? Math.min(18, Math.round(vsAvg * 100 * 1.5)) : 0,
+    detail: vsAvg > 0 ? `${Math.round(vsAvg * 100)}% above` : `${Math.round(-vsAvg * 100)}% below`,
+  });
+
+  const score = Math.max(0, 100 - lines.reduce((s, l) => s + l.points, 0));
+  const kind = score >= 75 ? "great" : score >= 50 ? "good" : score >= 25 ? "meh" : "bad";
+  const label = pump ? "Deal mirage" : kind === "great" ? "Real deal" : kind === "good" ? "Decent deal" : kind === "meh" ? "Nothing special" : "Skip for now";
+  return { score, kind, label, lines, pump };
+}
+
+// Plain-words verdict shown on cards and in the sheet.
 type Verdict = { kind: "great" | "good" | "fair" | "wait" | "new"; label: string; why: string };
 
 function verdict(p: Product): Verdict {
@@ -134,7 +244,7 @@ function verdict(p: Product): Verdict {
   const vsAvg = (p.price - p.average) / p.average;
   const vsLow = (p.price - p.lowest) / p.lowest;
   const cur = money(p.price, p.currency);
-  const avg = money(Math.round(p.average), p.currency);
+  const avg = money(tidy(p, p.average), p.currency);
   if (vsLow <= 0.005 && vsAvg <= -0.03) {
     return { kind: "great", label: "Great price", why: `${cur} is the lowest seen and ${Math.round(-vsAvg * 100)}% under the average of ${avg}.` };
   }
@@ -158,63 +268,156 @@ const isHit = (p: Product): boolean => p.target != null && p.price != null && p.
 const dropPct = (p: Product): number =>
   p.first && p.price != null ? (p.first - p.price) / p.first : 0;
 
-function visible(): Product[] {
+function visible(list: Product[]): Product[] {
   const q = state.query.toLowerCase();
-  const list = state.products.filter((p) => {
+  const shown = list.filter((p) => {
     if (q && !`${p.title} ${p.store}`.toLowerCase().includes(q)) return false;
     switch (state.filter) {
       case "dropped": return isDropped(p);
+      case "alerts": return p.target != null;
       case "target": return isHit(p);
       case "out": return p.availability === "out_of_stock";
+      case "bought": return p.bought_at != null;
       default: return true;
     }
   });
   const by: Record<Sort, (a: Product, b: Product) => number> = {
     recent: (a, b) => b.created_at - a.created_at,
     drop: (a, b) => dropPct(b) - dropPct(a),
+    score: (a, b) => (dealScore(b).score ?? -1) - (dealScore(a).score ?? -1),
     low: (a, b) => (a.price ?? Infinity) - (b.price ?? Infinity),
     high: (a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity),
     name: (a, b) => a.title.localeCompare(b.title),
   };
-  return list.sort(by[state.sort]);
+  return shown.sort(by[state.sort]);
+}
+
+function setEmpty(show: boolean, title = "", text = ""): void {
+  $("empty").hidden = !show;
+  $("emptyTitle").textContent = title;
+  $("emptyText").textContent = text;
 }
 
 function render(): void {
   document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
     b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter))
   );
+  $("dealsBar").hidden = state.filter !== "deals" || state.mode === "search";
+  $("searchHead").hidden = state.mode !== "search";
+  $("sharedBanner").hidden = state.mode !== "shared";
+
+  if (state.mode === "search") return renderSearch();
   if (state.filter === "deals") {
     void renderDeals();
     return;
   }
 
-  const all = state.products;
-  const shown = visible();
+  const shared = state.mode === "shared";
+  const all = shared ? (state.shared?.products ?? []) : state.products;
+  const shown = visible(all);
 
+  $("heading").textContent = shared ? "Shared list" : "Prices";
   $("subtitle").textContent = all.length
-    ? `${all.length} product${all.length === 1 ? "" : "s"} · ${all.filter(isDropped).length} dropped · ${all.filter(isHit).length} below target`
-    : "Paste a product link to start watching its price.";
+    ? `${all.length} product${all.length === 1 ? "" : "s"} · ${all.filter(isDropped).length} dropped · ${all.filter(isHit).length} below target${shared ? "" : ` · ${all.filter((p) => p.bought_at).length} bought`}`
+    : shared ? "This list is empty." : "Paste a product link to start watching its price, or type a product name to search.";
 
-  const empty = $("empty");
-  empty.hidden = !state.loaded || shown.length > 0;
-  $("emptyTitle").textContent = all.length ? "Nothing here" : "No products yet";
-  $("emptyText").textContent = all.length
-    ? "No tracked product matches this filter or search."
-    : "Add a link from any online store. We'll check its price every 6 hours.";
-
-  $("products").replaceChildren(...shown.map(card));
+  const noneAtAll = all.length === 0;
+  setEmpty(state.loaded && shown.length === 0,
+    noneAtAll ? "No products yet" : "Nothing here",
+    noneAtAll
+      ? "Add a link from any online store, or search a product by name. We'll check prices every 6 hours."
+      : "No tracked product matches this filter.");
+  $("products").replaceChildren(...shown.map((p) => card(p, shared)));
 }
+
+// ---------- search mode (name instead of a link) ----------
+
+async function runSearch(query: string): Promise<void> {
+  state.mode = "search";
+  state.search = { query, hits: [], blocked: [], loading: true };
+  render();
+  try {
+    const data = await api<CompareResponse>(`/api/compare?q=${encodeURIComponent(query)}`);
+    if (state.search.query !== query) return;
+    state.search = { query, hits: data.hits, blocked: data.blocked, loading: false };
+  } catch (err) {
+    if (state.search.query !== query) return;
+    state.search = { query, hits: [], blocked: ["flipkart.com"], loading: false };
+    toast((err as Error).message, "error");
+  }
+  render();
+}
+
+function renderSearch(): void {
+  const s = state.search;
+  $("heading").textContent = "Search";
+  $("subtitle").textContent = "Pick a result to track it, or paste a link from any store.";
+  $("searchTitle").textContent = s.loading ? `Searching for “${s.query}”…` : `Results for “${s.query}”`;
+  $("searchLinks").replaceChildren(...storeLinks(s.query));
+  setEmpty(!s.loading && s.hits.length === 0, "No results",
+    s.blocked.includes("flipkart.com") ? "Flipkart didn't answer just now. Try again, or use the store links above." : "Try fewer or different words.");
+  $("products").replaceChildren(...s.hits.map(hitCard));
+}
+
+function storeLinks(q: string): HTMLAnchorElement[] {
+  return STORE_SEARCH.map(([name, make]) => {
+    const a = el("a", undefined, `${name} ↗`);
+    a.href = make(q);
+    a.target = "_blank";
+    a.rel = "noopener";
+    return a;
+  });
+}
+
+function hitCard(h: CompareHit): HTMLElement {
+  const c = el("article", "card result");
+  c.append(cardTop(h.image, h.title, h.url, h.store));
+  const row = el("div", "price-row");
+  row.append(el("span", "price", money(h.price, h.currency || "INR")));
+  const foot = el("div", "card-foot");
+  const mine = state.products.find((p) => p.url === h.url);
+  const track = el("button", "pill", mine ? "Tracking ✓" : "Track this");
+  track.disabled = !!mine;
+  track.addEventListener("click", () => trackUrl(h.url, track));
+  foot.append(el("span", "spacer"), track);
+  c.append(row, foot);
+  return c;
+}
+
+$("searchClose").addEventListener("click", () => {
+  state.mode = state.shared ? "shared" : "list";
+  $<HTMLInputElement>("url").value = "";
+  render();
+});
+
+// Voice search (Chrome, Safari, Edge). The button hides where it isn't supported.
+type Recognition = { lang: string; start(): void; onresult: (e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void; onerror: () => void; onend: () => void };
+const SpeechCtor = (window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition });
+const RecognitionImpl = SpeechCtor.SpeechRecognition || SpeechCtor.webkitSpeechRecognition;
+if (!RecognitionImpl) $("voice").hidden = true;
+$("voice").addEventListener("click", () => {
+  if (!RecognitionImpl) return;
+  const r = new RecognitionImpl();
+  r.lang = navigator.language || "en-IN";
+  $("voice").classList.add("listening");
+  r.onresult = (e) => {
+    const text = e.results[0][0].transcript;
+    $<HTMLInputElement>("url").value = text;
+    $<HTMLFormElement>("add").requestSubmit();
+  };
+  r.onerror = () => toast("Didn't catch that. Try again.", "error");
+  r.onend = () => $("voice").classList.remove("listening");
+  r.start();
+});
 
 // ---------- deals feed ----------
 
 async function renderDeals(): Promise<void> {
+  $("heading").textContent = "Deals";
   $("subtitle").textContent = "Biggest price drops in the last 7 days, across everything people track here.";
-  $("empty").hidden = true;
   if (!state.deals) {
     $("products").replaceChildren();
-    $("emptyTitle").textContent = "Loading deals…";
-    $("emptyText").textContent = "";
-    $("empty").hidden = false;
+    setEmpty(true, "Loading deals…", "");
     try {
       const data = await api<DealsResponse>("/api/deals");
       state.deals = data.deals;
@@ -222,23 +425,43 @@ async function renderDeals(): Promise<void> {
       toast(`Could not load deals: ${(err as Error).message}`, "error");
       state.deals = [];
     }
-    if (state.filter !== "deals") return;
+    if (state.filter !== "deals" || state.mode === "search") return;
   }
+
+  // Category chips from what's actually on offer.
+  const cats = new Map<string, number>();
+  for (const d of state.deals) cats.set(categoryOf(d.title), (cats.get(categoryOf(d.title)) ?? 0) + 1);
+  if (!cats.has(state.dealCat) && state.dealCat !== "all") state.dealCat = "all";
+  const chips = $("dealCats");
+  chips.replaceChildren(...[["all", "All"], ...[...cats.keys()].sort().map((c) => [c, c])].map(([key, label]) => {
+    const b = el("button", undefined, label === "All" ? label : `${label} · ${cats.get(key)}`);
+    b.setAttribute("aria-pressed", String(state.dealCat === key));
+    b.addEventListener("click", () => { state.dealCat = key; render(); });
+    return b;
+  }));
+
   const q = state.query.toLowerCase();
-  const list = state.deals.filter((d) => !q || `${d.title} ${d.store}`.toLowerCase().includes(q));
-  $("empty").hidden = list.length > 0;
-  $("emptyTitle").textContent = "No deals yet";
-  $("emptyText").textContent = "Deals show up here when a tracked product's price falls. Check back after a few checks.";
+  const list = state.deals.filter((d) =>
+    (!q || `${d.title} ${d.store}`.toLowerCase().includes(q)) &&
+    (state.dealCat === "all" || categoryOf(d.title) === state.dealCat) &&
+    d.drop_pct >= state.dealMin
+  );
+  setEmpty(list.length === 0, "No deals here",
+    state.deals.length ? "Try another category or a smaller discount." : "Deals show up here when a tracked product's price falls. Check back after a few checks.");
   $("products").replaceChildren(...list.map(dealCard));
 }
 
-function dealCard(d: Deal): HTMLElement {
-  const c = el("article", "card deal");
+$<HTMLSelectElement>("dealMin").addEventListener("change", (e) => {
+  state.dealMin = Number((e.target as HTMLSelectElement).value) || 0;
+  render();
+});
+
+function cardTop(image: string | null, title: string, url: string, store: string): HTMLElement {
   const top = el("div", "card-top");
   const frame = el("div", "photo");
-  if (d.image) {
+  if (image) {
     const img = el("img");
-    img.src = d.image;
+    img.src = image;
     img.alt = "";
     img.loading = "lazy";
     img.referrerPolicy = "no-referrer";
@@ -246,12 +469,18 @@ function dealCard(d: Deal): HTMLElement {
     frame.append(img);
   }
   const info = el("div", "info");
-  const title = el("a", "title", d.title);
-  title.href = d.url;
-  title.target = "_blank";
-  title.rel = "noopener";
-  info.append(title, el("div", "store", d.store));
+  const a = el("a", "title", title);
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener";
+  info.append(a, el("div", "store", store));
   top.append(frame, info);
+  return top;
+}
+
+function dealCard(d: Deal): HTMLElement {
+  const c = el("article", "card deal");
+  c.append(cardTop(d.image, d.title, d.url, d.store));
 
   const row = el("div", "price-row");
   row.append(
@@ -260,6 +489,7 @@ function dealCard(d: Deal): HTMLElement {
     el("span", "drop-big", `−${d.drop_pct}%`)
   );
   if (d.list_price) row.append(el("span", "chip off", `${Math.round((1 - d.price / d.list_price) * 100)}% off MRP`));
+  row.append(el("span", "chip cat", categoryOf(d.title)));
 
   const foot = el("div", "card-foot");
   const stamp = el("span", "muted", `Dropped ${ago(d.checked_at)}`);
@@ -268,7 +498,7 @@ function dealCard(d: Deal): HTMLElement {
   track.disabled = mine;
   track.addEventListener("click", () => trackUrl(d.url, track));
   foot.append(stamp, el("span", "spacer"), track);
-  c.append(top, row, foot);
+  c.append(row, foot);
   return c;
 }
 
@@ -287,29 +517,13 @@ async function trackUrl(url: string, button: HTMLButtonElement): Promise<void> {
   }
 }
 
-function card(p: Product): HTMLElement {
+// ---------- product card ----------
+
+function card(p: Product, readOnly = false): HTMLElement {
   const c = el("article", "card");
   if (isHit(p)) c.classList.add("hit");
-
-  // Photo, title, store
-  const top = el("div", "card-top");
-  const frame = el("div", "photo");
-  if (p.image) {
-    const img = el("img");
-    img.src = p.image;
-    img.alt = "";
-    img.loading = "lazy";
-    img.referrerPolicy = "no-referrer";
-    img.onerror = () => img.remove();
-    frame.append(img);
-  }
-  const info = el("div", "info");
-  const title = el("a", "title", p.title);
-  title.href = p.url;
-  title.target = "_blank";
-  title.rel = "noopener";
-  info.append(title, el("div", "store", p.store));
-  top.append(frame, info);
+  if (p.bought_at) c.classList.add("bought");
+  c.append(cardTop(p.image, p.title, p.url, p.store));
 
   // Price, change since first check, badges
   const row = el("div", "price-row");
@@ -323,10 +537,10 @@ function card(p: Product): HTMLElement {
     row.append(chip);
   }
   if (isHit(p)) row.append(el("span", "chip hit", "Below target"));
-  const v = verdict(p);
-  if (v.kind !== "new") {
-    const chip = el("span", `chip ${v.kind}`, v.label);
-    chip.title = v.why;
+  const ds = dealScore(p);
+  if (ds.score != null) {
+    const chip = el("span", `chip score ${ds.kind}`, `${ds.label} · ${ds.score}`);
+    chip.title = "Deal score out of 100. Open History for the breakup.";
     row.append(chip);
   } else if (p.history.length > 2 && p.price != null && p.price === p.lowest) {
     row.append(el("span", "chip low", "Lowest yet"));
@@ -338,6 +552,9 @@ function card(p: Product): HTMLElement {
   }
   if (p.availability === "out_of_stock") row.append(el("span", "chip stock out", "Out of stock"));
   else if (p.availability === "preorder") row.append(el("span", "chip stock", "Pre-order"));
+  if (p.bought_at) {
+    row.append(el("span", "chip bought", `Bought ${money(p.bought_price, p.currency)} · ${dateShort(p.bought_at)}`));
+  }
 
   const stats = el("div", "stats");
   const stat = (label: string, value: string) => {
@@ -348,15 +565,27 @@ function card(p: Product): HTMLElement {
   stats.append(
     stat("Low", money(p.lowest, p.currency)),
     stat("High", money(p.highest, p.currency)),
-    stat("Avg", money(p.average != null && p.price != null && Number.isInteger(p.price) ? Math.round(p.average) : p.average, p.currency)),
+    stat("Avg", money(tidy(p, p.average), p.currency)),
     stat("Checked", ago(p.checked_at))
   );
 
-  c.append(top, row, chart(p, 72), stats);
+  c.append(row, chart(p, 72), stats);
   if (p.error) c.append(el("p", "err", `Last check failed: ${p.error}`));
 
-  // Target price, history, check now, remove
   const foot = el("div", "card-foot");
+  if (readOnly) {
+    const history = el("button", "pill", "History");
+    history.addEventListener("click", () => openHistory(p, true));
+    const mine = state.products.some((x) => x.url === p.url);
+    const track = el("button", "pill", mine ? "Tracking ✓" : "Track this");
+    track.disabled = mine;
+    track.addEventListener("click", () => trackUrl(p.url, track));
+    foot.append(history, el("span", "spacer"), track);
+    c.append(foot);
+    return c;
+  }
+
+  // Target price, history, check now, bought, remove
   const label = el("label", "target");
   label.append(el("span", undefined, "Alert below"));
   const target = el("input");
@@ -374,9 +603,12 @@ function card(p: Product): HTMLElement {
   const check = el("button", "pill", "Check");
   check.title = "Check the price now";
   check.addEventListener("click", () => checkNow(p, check));
+  const bought = el("button", "pill", p.bought_at ? "Not bought" : "Bought");
+  bought.title = p.bought_at ? "Clear the purchase" : "Mark as bought and add it to your Spend";
+  bought.addEventListener("click", () => markBought(p));
   const remove = el("button", "pill danger", "Remove");
   remove.addEventListener("click", () => removeProduct(p));
-  foot.append(label, history, check, remove);
+  foot.append(label, history, check, bought, remove);
   c.append(foot);
   return c;
 }
@@ -432,16 +664,38 @@ function chart(p: Product, height: number): SVGElement {
   return svg;
 }
 
+// ---------- deal score gauge ----------
+
+function gauge(ds: DealScore): SVGElement {
+  const W = 120, H = 70, cx = 60, cy = 62, r = 48;
+  const svg = svgEl("svg", { class: "gauge-svg", viewBox: `0 0 ${W} ${H}`, role: "img" });
+  svg.setAttribute("aria-label", ds.score == null ? "No deal score yet" : `Deal score ${ds.score} out of 100`);
+  const arc = (from: number, to: number, cls: string) => {
+    // 0..1 along the half circle, left to right
+    const a0 = Math.PI * (1 - from), a1 = Math.PI * (1 - to);
+    const x0 = cx + r * Math.cos(a0), y0 = cy - r * Math.sin(a0);
+    const x1 = cx + r * Math.cos(a1), y1 = cy - r * Math.sin(a1);
+    return svgEl("path", { class: `seg ${cls}`, d: `M ${x0.toFixed(1)} ${y0.toFixed(1)} A ${r} ${r} 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}` });
+  };
+  svg.append(arc(0, 0.25, "s-bad"), arc(0.25, 0.5, "s-meh"), arc(0.5, 0.75, "s-good"), arc(0.75, 1, "s-great"));
+  const v = ds.score == null ? 0.5 : ds.score / 100;
+  const a = Math.PI * (1 - v);
+  const nx = cx + (r - 10) * Math.cos(a), ny = cy - (r - 10) * Math.sin(a);
+  svg.append(
+    svgEl("line", { class: `needle ${ds.score == null ? "none" : ""}`, x1: cx, y1: cy, x2: nx.toFixed(1), y2: ny.toFixed(1) }),
+    svgEl("circle", { class: "hub", cx, cy, r: 4 })
+  );
+  const t = svgEl("text", { class: "score-num", x: cx, y: cy - 14, "text-anchor": "middle" });
+  t.textContent = ds.score == null ? "–" : String(ds.score);
+  svg.append(t);
+  return svg;
+}
+
 // ---------- history sheet with timeline ----------
 
 const DAY = 86400000;
 let sheetProduct: Product | null = null;
 let sheetRange = 0; // days; 0 = all
-
-const dateShort = (ms: number) =>
-  new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
-const dateLong = (ms: number) =>
-  new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 
 function rangeHistory(p: Product, days: number): PricePoint[] {
   if (!days) return p.history;
@@ -589,7 +843,7 @@ document.querySelectorAll<HTMLButtonElement>("#hRange button").forEach((b) =>
   })
 );
 
-// ---------- compare across stores ----------
+// ---------- compare across stores / related ----------
 
 const STORE_SEARCH: Array<[string, (q: string) => string]> = [
   ["Amazon.in", (q) => `https://www.amazon.in/s?k=${encodeURIComponent(q)}`],
@@ -611,23 +865,39 @@ function searchWords(title: string): string {
     .join(" ");
 }
 
-async function openCompare(p: Product): Promise<void> {
-  const panel = $("hComparePanel");
-  panel.hidden = !panel.hidden;
-  if (panel.hidden) return;
+function hitRow(h: { title: string; url: string; store: string; image: string | null; price: number | null; currency: string | null }, compareTo: number | null): HTMLElement {
+  const row = el("div", "hit");
+  const img = el("img");
+  img.src = h.image || "";
+  img.alt = "";
+  img.referrerPolicy = "no-referrer";
+  img.onerror = () => img.remove();
+  const mid = el("div");
+  const t = el("a", "t", h.title);
+  t.href = h.url;
+  t.target = "_blank";
+  t.rel = "noopener";
+  mid.append(t, el("div", "s", h.store));
+  const right = el("div", "hit-right");
+  const cheaper = h.price != null && compareTo != null && h.price < compareTo;
+  right.append(el("span", `p ${cheaper ? "cheaper" : ""}`, money(h.price, h.currency || "INR")));
+  const mine = state.products.some((x) => x.url === h.url);
+  const track = el("button", "pill", mine ? "Tracking ✓" : "Track");
+  track.disabled = mine;
+  track.addEventListener("click", () => trackUrl(h.url, track));
+  right.append(track);
+  row.append(img, mid, right);
+  return row;
+}
+
+async function loadRelated(p: Product): Promise<void> {
   const q = searchWords(p.title);
-  const links = $("hCompareLinks");
-  links.replaceChildren(...STORE_SEARCH.map(([name, make]) => {
-    const a = el("a", undefined, `${name} ↗`);
-    a.href = make(q);
-    a.target = "_blank";
-    a.rel = "noopener";
-    return a;
-  }));
+  $("hCompareLinks").replaceChildren(...storeLinks(q));
   const hits = $("hCompareHits");
   hits.replaceChildren(el("p", "muted", "Looking on Flipkart…"));
   try {
     const data = await api<CompareResponse>(`/api/compare?q=${encodeURIComponent(q)}`);
+    if (sheetProduct !== p) return;
     hits.replaceChildren();
     const found = data.hits.filter((h) => h.url !== p.url);
     if (!found.length) {
@@ -635,40 +905,54 @@ async function openCompare(p: Product): Promise<void> {
         ? "Flipkart didn't answer just now. Use the store links above."
         : "No close matches found. Use the store links above."));
     }
-    for (const h of found) {
-      const row = el("div", "hit");
-      const img = el("img");
-      img.src = h.image || "";
-      img.alt = "";
-      img.referrerPolicy = "no-referrer";
-      const mid = el("div");
-      const t = el("a", "t", h.title);
-      t.href = h.url;
-      t.target = "_blank";
-      t.rel = "noopener";
-      mid.append(t, el("div", "s", h.store));
-      const right = el("div", "hit-right");
-      const cheaper = h.price != null && p.price != null && h.price < p.price;
-      right.append(el("span", `p ${cheaper ? "cheaper" : ""}`, money(h.price, h.currency || p.currency)));
-      const mine = state.products.some((x) => x.url === h.url);
-      const track = el("button", "pill", mine ? "Tracking ✓" : "Track");
-      track.disabled = mine;
-      track.addEventListener("click", () => trackUrl(h.url, track));
-      right.append(track);
-      row.append(img, mid, right);
-      hits.append(row);
-    }
-    hits.append(el("p", "muted", "Other stores block automatic lookups; their links open a search."));
+    for (const h of found) hits.append(hitRow(h, p.price));
   } catch (err) {
-    hits.replaceChildren(el("p", "muted", `Couldn't compare: ${(err as Error).message}`));
+    hits.replaceChildren(el("p", "muted", `Couldn't look up other stores: ${(err as Error).message}`));
   }
 }
 
-$("hCompare").addEventListener("click", () => { if (sheetProduct) openCompare(sheetProduct); });
+async function loadCategoryDeals(p: Product): Promise<void> {
+  const box = $("hCatDeals");
+  box.hidden = true;
+  if (!state.deals) {
+    try { state.deals = (await api<DealsResponse>("/api/deals")).deals; } catch { state.deals = []; }
+  }
+  if (sheetProduct !== p) return;
+  const cat = categoryOf(p.title);
+  const list = state.deals.filter((d) => d.url !== p.url && categoryOf(d.title) === cat).slice(0, 6);
+  if (!list.length) return;
+  (box.querySelector("h3") as HTMLElement).textContent = `Deals in ${cat === "Other" ? "this category" : cat}`;
+  $("hCatList").replaceChildren(...list.map((d) =>
+    hitRow({ title: d.title, url: d.url, store: `${d.store} · −${d.drop_pct}%`, image: d.image, price: d.price, currency: d.currency }, null)
+  ));
+  box.hidden = false;
+}
 
-function openHistory(p: Product): void {
+function openHistory(p: Product, readOnly = false): void {
   sheetProduct = p;
-  $("hComparePanel").hidden = true;
+  $("hTitle").textContent = p.title;
+  $("hMeta").textContent = `${p.store} · ${p.history.length} check${p.history.length === 1 ? "" : "s"} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(tidy(p, p.average), p.currency)}`;
+
+  // Deal score
+  const ds = dealScore(p);
+  $("hGauge").replaceChildren(gauge(ds));
+  const label = $("hScoreLabel");
+  label.textContent = ds.label;
+  label.dataset.kind = ds.kind;
+  $("hScoreWhy").textContent = ds.score == null
+    ? "The score needs at least 3 price checks. It builds up over the next day."
+    : ds.pump ? "The price went up shortly before this \"drop\", so the saving is smaller than it looks."
+    : ds.score >= 75 ? "Close to the best price seen here, with no tricks spotted."
+    : ds.score >= 50 ? "A fair price, but it has been lower."
+    : "Well above the lows seen here. Waiting is likely to pay off.";
+  const body = $("hBreakup").querySelector("tbody") as HTMLTableSectionElement;
+  body.replaceChildren(...ds.lines.map((l) => {
+    const tr = el("tr");
+    tr.append(el("td", undefined, l.label), el("td", "muted-cell", l.detail), el("td", `num ${l.points ? "up" : ""}`, l.points ? `−${l.points}` : "0"));
+    return tr;
+  }));
+
+  // Plain verdict
   const v = verdict(p);
   const box = $("hVerdict");
   box.dataset.kind = v.kind;
@@ -676,28 +960,39 @@ function openHistory(p: Product): void {
   if (inflatedList(p)) {
     box.append(el("span", "why", `The listed MRP of ${money(p.list_price, p.currency)} is far above any price seen here, so the "% off" is mostly marketing.`));
   }
-  $("hTitle").textContent = p.title;
-  const avg = p.average != null && p.price != null && Number.isInteger(p.price) ? Math.round(p.average) : p.average;
-  $("hMeta").textContent = `${p.store} · ${p.history.length} check${p.history.length === 1 ? "" : "s"} · low ${money(p.lowest, p.currency)} · high ${money(p.highest, p.currency)} · avg ${money(avg, p.currency)}`;
+
   renderHistoryChart();
   $<HTMLAnchorElement>("hOpen").href = p.url;
-  $<HTMLAnchorElement>("hCsv").href = `/api/products/${p.id}/history.csv`;
+  const shareText = `${p.title} — ${money(p.price, p.currency)} on ${p.store}`;
+  $<HTMLAnchorElement>("hWhatsApp").href = `https://wa.me/?text=${encodeURIComponent(`${shareText}\n${p.url}`)}`;
+  $("hShare").hidden = !("share" in navigator);
+  $("hShare").onclick = () => navigator.share({ title: p.title, text: shareText, url: p.url }).catch(() => {});
+  $("hCopy").onclick = async () => {
+    try { await navigator.clipboard.writeText(p.url); toast("Link copied", "success"); } catch { toast("Couldn't copy", "error"); }
+  };
+  const csv = $<HTMLAnchorElement>("hCsv");
+  csv.href = `/api/products/${p.id}/history.csv`;
+  csv.hidden = readOnly;
 
-  const body = $("hTable").querySelector("tbody") as HTMLTableSectionElement;
-  body.replaceChildren();
+  // Every check
+  const tbody = $("hTable").querySelector("tbody") as HTMLTableSectionElement;
+  tbody.replaceChildren();
   const rows: PricePoint[] = [...p.history].reverse();
-  rows.forEach(([t, v], i) => {
+  rows.forEach(([t, val], i) => {
     const prev = rows[i + 1];
     const tr = el("tr");
     tr.append(el("td", undefined, when(t)));
-    tr.append(el("td", "num", money(v, p.currency)));
-    const diff = prev ? v - prev[1] : 0;
-    const cell = el("td", `num ${diff < 0 ? "down" : diff > 0 ? "up" : ""}`,
-      prev && diff !== 0 ? `${diff < 0 ? "▼" : "▲"} ${money(Math.abs(diff), p.currency)}` : "–");
-    tr.append(cell);
-    body.append(tr);
+    tr.append(el("td", "num", money(val, p.currency)));
+    const diff = prev ? val - prev[1] : 0;
+    tr.append(el("td", `num ${diff < 0 ? "down" : diff > 0 ? "up" : ""}`,
+      prev && diff !== 0 ? `${diff < 0 ? "▼" : "▲"} ${money(Math.abs(diff), p.currency)}` : "–"));
+    tbody.append(tr);
   });
+
   $<HTMLDialogElement>("historySheet").showModal();
+  $<HTMLDialogElement>("historySheet").scrollTop = 0;
+  void loadRelated(p);
+  void loadCategoryDeals(p);
 }
 
 // CSV download needs the owner header, which a plain link can't send.
@@ -724,17 +1019,27 @@ $("hCsv").addEventListener("click", async (e) => {
 $<HTMLFormElement>("add").addEventListener("submit", async (e) => {
   e.preventDefault();
   const button = $<HTMLButtonElement>("track");
-  const url = $<HTMLInputElement>("url");
+  const input = $<HTMLInputElement>("url");
   const target = $<HTMLInputElement>("target");
+  const value = input.value.trim();
+  if (!value) return;
+
+  // A product name rather than a link: search instead of tracking.
+  if (!isUrl(value)) {
+    void runSearch(value);
+    return;
+  }
+
   button.disabled = true;
   button.textContent = "Reading…";
   try {
     await api("/api/products", {
       method: "POST",
-      body: JSON.stringify({ url: url.value.trim(), target: target.value || null }),
+      body: JSON.stringify({ url: value, target: target.value || null }),
     });
-    url.value = "";
+    input.value = "";
     target.value = "";
+    if (state.mode === "search") state.mode = "list";
     toast("Added. We'll watch this price for you.", "success");
     await load();
   } catch (err) {
@@ -745,13 +1050,39 @@ $<HTMLFormElement>("add").addEventListener("submit", async (e) => {
   }
 });
 
+$<HTMLInputElement>("url").addEventListener("input", (e) => {
+  const v = (e.target as HTMLInputElement).value.trim();
+  $("track").textContent = v && !isUrl(v) ? "Search" : "Track";
+});
+
+async function update(p: Product, body: UpdateRequest): Promise<void> {
+  await api(`/api/products/${p.id}`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
 async function setTarget(p: Product, value: string): Promise<void> {
   try {
-    await api(`/api/products/${p.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ target: value === "" ? null : Number(value) }),
-    });
+    await update(p, { target: value === "" ? null : Number(value) });
     toast(value === "" ? "You'll be told about any drop" : `We'll flag it at or below ${money(Number(value), p.currency)}`, "success");
+    await load();
+  } catch (err) {
+    toast((err as Error).message, "error");
+  }
+}
+
+async function markBought(p: Product): Promise<void> {
+  try {
+    if (p.bought_at) {
+      await update(p, { bought: null });
+      toast("Purchase cleared", "info");
+    } else {
+      const answer = prompt(`What did you pay for it? (${p.currency || ""})`, p.price == null ? "" : String(p.price));
+      if (answer == null) return;
+      const price = Number(answer.replace(/[^\d.]/g, ""));
+      if (!(price > 0)) { toast("Enter the price you paid", "error"); return; }
+      await update(p, { bought: { price } });
+      const saved = p.highest != null && p.highest > price ? ` You paid ${money(p.highest - price, p.currency)} less than its highest price.` : "";
+      toast(`Marked as bought.${saved}`, "success");
+    }
     await load();
   } catch (err) {
     toast((err as Error).message, "error");
@@ -787,21 +1118,12 @@ async function removeProduct(p: Product): Promise<void> {
 document.querySelectorAll<HTMLButtonElement>("#filters button").forEach((b) =>
   b.addEventListener("click", () => {
     state.filter = (b.dataset.filter as Filter) || "all";
+    if (state.mode === "search") state.mode = state.shared ? "shared" : "list";
     if (state.filter === "deals") state.deals = null; // refresh each visit
     render();
   })
 );
 
-// Shared to the app from another app (Web Share Target), or opened with ?url=.
-function handleSharedLink(): void {
-  const params = new URLSearchParams(location.search);
-  const text = [params.get("url"), params.get("text"), params.get("title")].filter(Boolean).join(" ");
-  const link = /https?:\/\/\S+/.exec(text || "")?.[0];
-  if (!link) return;
-  history.replaceState(null, "", "/");
-  $<HTMLInputElement>("url").value = link;
-  $<HTMLFormElement>("add").requestSubmit();
-}
 $<HTMLInputElement>("search").addEventListener("input", (e) => {
   state.query = (e.target as HTMLInputElement).value.trim();
   render();
@@ -822,6 +1144,55 @@ document.addEventListener("paste", (e) => {
   }
 });
 
+// ---------- links in: share target, ?url=, ?list= ----------
+
+async function handleQuery(): Promise<void> {
+  const params = new URLSearchParams(location.search);
+
+  const list = params.get("list");
+  if (list && /^[A-Za-z0-9_-]{16,64}$/.test(list)) {
+    try {
+      const data = await api<ListResponse>(`/api/shared/${list}`);
+      state.shared = { token: list, products: data.products };
+      state.mode = "shared";
+      render();
+    } catch (err) {
+      toast((err as Error).message, "error");
+    }
+    return;
+  }
+
+  // The "Track price" bookmark: it read the page in the person's browser and
+  // sends what it saw, for stores that turn the Worker away.
+  const capture = params.get("capture");
+  if (capture) {
+    history.replaceState(null, "", "/");
+    let snap: Snapshot & { url?: string };
+    try { snap = JSON.parse(capture); } catch { toast("The bookmark sent something unreadable", "error"); return; }
+    if (!snap.url || !isUrl(snap.url)) { toast("The bookmark didn't include the page link", "error"); return; }
+    toast(`Saving ${snap.title ? `“${snap.title.slice(0, 40)}”` : "the product"}…`, "info");
+    try {
+      const r = await api<{ ok: boolean; price: number; currency: string | null; updated?: boolean }>("/api/products", {
+        method: "POST",
+        body: JSON.stringify({ url: snap.url, snapshot: snap.price ? snap : undefined }),
+      });
+      toast(r.updated ? `Price updated: ${money(r.price, r.currency)}` : `Tracking it at ${money(r.price, r.currency)}`, "success");
+      await load();
+    } catch (err) {
+      toast((err as Error).message, "error");
+    }
+    return;
+  }
+
+  // Shared to the app (Web Share Target), the /https://... prefix.
+  const text = [params.get("url"), params.get("text"), params.get("title")].filter(Boolean).join(" ");
+  const link = /https?:\/\/\S+/.exec(text || "")?.[0];
+  if (!link) return;
+  history.replaceState(null, "", "/");
+  $<HTMLInputElement>("url").value = link;
+  $<HTMLFormElement>("add").requestSubmit();
+}
+
 // ---------- sheets ----------
 
 document.querySelectorAll<HTMLButtonElement>("[data-close]").forEach((b) =>
@@ -832,8 +1203,45 @@ document.querySelectorAll<HTMLDialogElement>("dialog").forEach((d) =>
   d.addEventListener("click", (e) => { if (e.target === d) d.close(); })
 );
 
+function renderSpend(): void {
+  const bought = state.products.filter((p) => p.bought_at && p.bought_price != null);
+  const box = $("spend");
+  box.replaceChildren();
+  if (!bought.length) {
+    box.append(el("p", "muted", "Nothing bought yet."));
+    return;
+  }
+  const currency = bought[0].currency;
+  const paid = bought.reduce((s, p) => s + (p.bought_price as number), 0);
+  const vsHigh = bought.reduce((s, p) => s + Math.max(0, (p.highest ?? 0) - (p.bought_price as number)), 0);
+  const vsList = bought.reduce((s, p) => s + Math.max(0, (p.list_price ?? 0) - (p.bought_price as number)), 0);
+  const tile = (k: string, v: string) => {
+    const d = el("div", "tile");
+    d.append(el("div", "k", k), el("div", "v", v));
+    return d;
+  };
+  const tiles = el("div", "tiles");
+  tiles.append(
+    tile("Bought", `${bought.length} item${bought.length === 1 ? "" : "s"}`),
+    tile("Paid", money(paid, currency)),
+    tile("Saved vs highest seen", money(vsHigh, currency)),
+    tile("Saved vs MRP", vsList ? money(vsList, currency) : "—"),
+  );
+  box.append(tiles);
+  const byStore = new Map<string, number>();
+  for (const p of bought) byStore.set(p.store, (byStore.get(p.store) ?? 0) + (p.bought_price as number));
+  const ul = el("ul", "spend-list");
+  for (const [storeName, sum] of [...byStore.entries()].sort((a, b) => b[1] - a[1])) {
+    const li = el("li");
+    li.append(el("span", undefined, storeName), el("b", undefined, money(sum, currency)));
+    ul.append(li);
+  }
+  box.append(ul);
+}
+
 $("settingsBtn").addEventListener("click", () => {
   $("syncCode").textContent = ownerId();
+  renderSpend();
   $<HTMLDialogElement>("settingsSheet").showModal();
 });
 $("copyCode").addEventListener("click", async () => {
@@ -852,7 +1260,54 @@ $<HTMLFormElement>("syncForm").addEventListener("submit", (e) => {
     return;
   }
   store.set("owner", code);
-  location.reload();
+  location.href = "/";
+});
+
+$("makeShare").addEventListener("click", async () => {
+  const button = $<HTMLButtonElement>("makeShare");
+  const code = $("shareLink");
+  if (code.dataset.url) {
+    try { await navigator.clipboard.writeText(code.dataset.url); toast("Share link copied", "success"); } catch { toast("Couldn't copy", "error"); }
+    return;
+  }
+  button.disabled = true;
+  try {
+    const r = await api<ShareResponse>("/api/share");
+    code.textContent = r.url;
+    code.dataset.url = r.url;
+    button.textContent = "Copy";
+    try { await navigator.clipboard.writeText(r.url); toast("Share link copied", "success"); } catch { /* shown in the box */ }
+  } catch (err) {
+    toast((err as Error).message, "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// The "Track price" bookmark. It runs on the store's page, so it can read
+// prices from stores that block the Worker, then opens this app with what it
+// found. Kept dependency-free and small; it is URL-encoded into the href.
+const BOOKMARKLET_SRC = `(function(){
+var D=document,T=function(s){return (s||"").replace(/\\s+/g," ").trim()},N=function(s){var m=String(s||"").match(/\\d[\\d.,]*/);if(!m)return null;var n=m[0];n=/,\\d{3}$/.test(n)?n.replace(/,/g,""):n.replace(/,/g,"");var v=parseFloat(n);return isFinite(v)&&v>0?v:null};
+var out={url:location.href,title:"",price:null,currency:null,image:null,availability:null,listPrice:null};
+var ld=D.querySelectorAll('script[type="application/ld+json"]');
+for(var i=0;i<ld.length&&out.price==null;i++){try{var j=JSON.parse(ld[i].textContent);var st=[].concat(j);while(st.length){var n=st.shift();if(!n||typeof n!="object")continue;if(Array.isArray(n)){st=st.concat(n);continue;}var ty=[].concat(n["@type"]||[]).join(" ");if(/Product/.test(ty)){var o=n.offers;o=Array.isArray(o)?o[0]:(o&&o.offers?[].concat(o.offers)[0]:o);if(o){out.price=N(o.price||o.lowPrice);out.currency=o.priceCurrency||null;out.availability=o.availability||null;}out.title=T(n.name);var im=n.image;im=Array.isArray(im)?im[0]:im;out.image=im&&im.url?im.url:(typeof im=="string"?im:null);if(out.price!=null)break;}if(n["@graph"])st=st.concat(n["@graph"]);}}catch(e){}}
+var M=function(k){var e=D.querySelector('meta[property="'+k+'"],meta[name="'+k+'"],meta[itemprop="'+k+'"]');return e?e.getAttribute("content"):null};
+if(out.price==null){out.price=N(M("product:price:amount")||M("og:price:amount")||M("price")||(D.querySelector('[itemprop="price"]')||{}).getAttribute&&(D.querySelector('[itemprop="price"]').getAttribute("content")||D.querySelector('[itemprop="price"]').textContent));out.currency=out.currency||M("product:price:currency")||M("og:price:currency")||M("priceCurrency");}
+if(out.price==null){var sel=D.querySelectorAll('#corePrice_feature_div .a-offscreen,#apex_desktop .a-price .a-offscreen,[data-testid*="price" i],[class*="price" i],[id*="price" i],[class*="amount" i]');var cnt={},best=null,bc=0;for(var k=0;k<sel.length&&k<80;k++){var tx=T(sel[k].textContent);if(tx.length>40||!/₹|Rs|INR|\\$|€|£/.test(tx))continue;var v=N(tx);if(!v)continue;cnt[v]=(cnt[v]||0)+1;if(cnt[v]>bc){bc=cnt[v];best=v;}}out.price=best;if(best&&!out.currency)out.currency=/₹|Rs|INR/.test(D.body.innerText)?"INR":null;}
+if(!out.title)out.title=T(M("og:title")||D.title);if(!out.image)out.image=M("og:image")||M("twitter:image");
+if(/currently unavailable|out of stock|sold out/i.test(D.body.innerText.slice(0,20000)))out.availability="OutOfStock";
+if(out.currency==null&&/₹/.test(D.body.innerText))out.currency="INR";
+if(out.price==null){alert("Price Tracker couldn't find a price on this page.");return;}
+window.open(__APP__+"/?capture="+encodeURIComponent(JSON.stringify(out)),"_blank");
+})()`;
+
+$("prefixTip").textContent = `${location.host}/`;
+$<HTMLAnchorElement>("bookmarklet").href =
+  "javascript:" + encodeURIComponent(BOOKMARKLET_SRC.replace("__APP__", JSON.stringify(location.origin)));
+$("bookmarklet").addEventListener("click", (e) => {
+  e.preventDefault();
+  toast("Drag this button to your bookmarks bar; clicking it here does nothing.", "info");
 });
 
 // ---------- push alerts ----------
@@ -931,10 +1386,10 @@ $("testPush").addEventListener("click", async () => {
 
 // ---------- start ----------
 
-state.sort = (["recent", "drop", "low", "high", "name"] as Sort[]).includes(store.get("sort", "") as Sort)
-  ? (store.get("sort", "recent") as Sort) : "recent";
+const SORTS: Sort[] = ["recent", "drop", "score", "low", "high", "name"];
+state.sort = SORTS.includes(store.get("sort", "") as Sort) ? (store.get("sort", "recent") as Sort) : "recent";
 $<HTMLSelectElement>("sort").value = state.sort;
 
-load().then(handleSharedLink);
+load().then(handleQuery);
 fetch("/api/config").then((r) => r.json()).then((c: ConfigResponse) => { state.config = c; }).catch(() => {});
 currentSubscription().then((s) => setAlertsUi(!!s)).catch(() => {});
