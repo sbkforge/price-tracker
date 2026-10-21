@@ -1385,6 +1385,15 @@ document.addEventListener("paste", (e) => {
 async function handleQuery(): Promise<void> {
   const params = new URLSearchParams(location.search);
 
+  // App shortcuts (Android launcher): /?tab=deals, /?tab=browse
+  const tab = params.get("tab");
+  if (tab === "deals" || tab === "browse") {
+    history.replaceState(null, "", "/");
+    state.filter = tab;
+    render();
+    return;
+  }
+
   const list = params.get("list");
   if (list && /^[A-Za-z0-9_-]{16,64}$/.test(list)) {
     try {

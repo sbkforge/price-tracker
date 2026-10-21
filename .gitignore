@@ -4,3 +4,12 @@ node_modules/
 .DS_Store
 public/app.js
 public/app.js.map
+android/.gradle/
+android/app/build/
+android/build/
+android/*.apk
+android/*.aab
+android/*.idsig
+android/local.properties
+android/app/src/main/res/mipmap-*/
+android/store_icon.png

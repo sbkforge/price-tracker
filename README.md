@@ -102,6 +102,18 @@ npx wrangler dev --test-scheduled
 curl "localhost:8787/__scheduled?cron=0+*+*+*+*"   # run the price check now
 ```
 
+## Android app
+
+`android/` holds a Trusted Web Activity built with [Bubblewrap](https://github.com/GoogleChromeLabs/bubblewrap): the live site in a full-screen Chrome container, with push alerts, share-to-app and launcher shortcuts. It verifies against `public/.well-known/assetlinks.json`, which lists the signing key's SHA-256 fingerprint.
+
+```sh
+brew install openjdk@17 && brew install --cask android-commandlinetools
+npm i -g @bubblewrap/cli            # ~/.bubblewrap/config.json points at the JDK and SDK
+cd android && bubblewrap update --skipVersionUpgrade && bubblewrap build --skipPwaValidation
+```
+
+`bubblewrap build` asks for the keystore password (or reads `BUBBLEWRAP_KEYSTORE_PASSWORD` / `BUBBLEWRAP_KEY_PASSWORD`) and produces `app-release-signed.apk` (install directly) and `app-release-bundle.aab` (Play Store). The keystore lives outside the repo; losing it means a new package can't update the old one, so back it up.
+
 ## Free plan limits
 
 - Every 15 minutes a run re-checks up to 25 products that are older than 6 hours: about 2,400 checks a day, enough for 600 products.

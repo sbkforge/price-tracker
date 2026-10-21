@@ -73,6 +73,10 @@ JSON-LD stores (Shopify brands, Myntra, Zepto, Vijay Sales, Samsung, Apple, Deca
 
 D1 `price-tracker` (id in `wrangler.jsonc`). Tables: `products` (one row per owner+url), `prices` (history), `subscriptions` (push). Migrations are plain SQL in `migrations/`, applied by wrangler; SQLite can't alter constraints, so `0002` recreated `products` to add `owner`.
 
+## Android app
+
+`android/twa-manifest.json` is the Bubblewrap config (package `in.sbkforge.pricetracker`, host = the live site). `bubblewrap update` regenerates the Gradle project from it; `bubblewrap build --skipPwaValidation` signs with the keystore at `~/Desktop/sbk_coding/price-tracker-android-keystore/` (password in `password.txt` there, never in the repo). The fingerprint in `public/.well-known/assetlinks.json` must match that key or Android shows the site with a browser bar. Build outputs and generated mipmaps are gitignored. Bump `appVersionCode`/`appVersionName` in `twa-manifest.json` before a new build.
+
 ## Frontend conventions
 
 - Build DOM with the `el()` helper and `textContent`; never `innerHTML` with store data.

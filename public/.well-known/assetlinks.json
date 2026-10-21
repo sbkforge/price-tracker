@@ -1,0 +1,8 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "in.sbkforge.pricetracker",
+    "sha256_cert_fingerprints": ["E2:10:21:2F:62:8C:41:6E:0C:E8:09:2E:5A:E1:FA:39:23:D7:59:3F:FE:0A:24:BD:8E:5B:45:2C:36:D2:46:EF"]
+  }
+}]
